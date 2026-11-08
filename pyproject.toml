@@ -1,23 +1,29 @@
 [build-system]
-requires = ["hatchling"]
+requires = ["hatchling==1.33.0"]
 build-backend = "hatchling.build"
 
 [project]
 name = "checkwash-prove"
-version = "0.1.0.dev0"
+dynamic = ["version"]
 description = "Experimental companion to checkwash: runs a change's old and new tests against catalogue mutants to show protection the change dropped."
 readme = "README.md"
 license = "Apache-2.0"
+license-files = ["LICENSE"]
 requires-python = ">=3.11"
 authors = [{ name = "taipei49314" }]
 keywords = ["mutation-testing", "pytest", "test-tampering", "ai-agent", "code-review"]
 classifiers = [
-    "Development Status :: 2 - Pre-Alpha",
+    "Development Status :: 3 - Alpha",
     "Environment :: Console",
     "Intended Audience :: Developers",
     "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3 :: Only",
     "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
+    "Topic :: Software Development :: Quality Assurance",
     "Topic :: Software Development :: Testing",
 ]
 # Nothing at run time: the tests run in the interpreter given with --python, which needs pytest 7 or later.
@@ -26,11 +32,33 @@ dependencies = []
 [project.optional-dependencies]
 dev = ["pytest>=8"]
 
+[project.urls]
+Homepage = "https://github.com/taipei49314/checkwash-prove"
+Source = "https://github.com/taipei49314/checkwash-prove"
+Issues = "https://github.com/taipei49314/checkwash-prove/issues"
+Changelog = "https://github.com/taipei49314/checkwash-prove/blob/main/CHANGELOG.md"
+checkwash = "https://github.com/taipei49314/checkwash"
+
 [project.scripts]
 checkwash-prove = "checkwash_prove.cli:main"
 
+[tool.hatch.version]
+path = "src/checkwash_prove/__init__.py"
+
 [tool.hatch.build.targets.wheel]
 packages = ["src/checkwash_prove"]
+
+[tool.hatch.build.targets.sdist]
+include = [
+    "/src",
+    "/tests",
+    "/README.md",
+    "/THREATMODEL.md",
+    "/CHANGELOG.md",
+    "/SECURITY.md",
+    "/LICENSE",
+    "/pyproject.toml",
+]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

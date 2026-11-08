@@ -6,4 +6,4 @@ catalogue v0.5-m2 (muJava's method-level operators mapped to Python, plus PY-ASR
 by hash.
 """
 
-__version__ = "0.1.0.dev0"
+__version__ = "0.1.0"

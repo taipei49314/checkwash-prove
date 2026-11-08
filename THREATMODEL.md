@@ -4,8 +4,8 @@ checkwash-prove executes the repository's code: product code, tests,
 `conftest.py` files and pytest configuration, at two revisions, many times,
 with your privileges. That is its job. checkwash's claims (local,
 byte-identical, no code under review runs) do not carry over to it; this
-page replaces them for this tool. It covers version 0.1.0.dev0, which is
-experimental and unreleased.
+page replaces them for this tool. It covers version 0.1.0, which is
+experimental.
 
 ## What it promises
 

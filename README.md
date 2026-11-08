@@ -1,16 +1,18 @@
 # checkwash-prove (experimental)
 
-`checkwash check` reads a diff and never runs your code. `checkwash-prove`
-asks the same question the opposite way: it **runs your tests** to show, with
-a concrete fault, what protection a change to them dropped.
+[checkwash](https://github.com/taipei49314/checkwash)'s `checkwash check`
+reads a diff and never runs your code. `checkwash-prove` asks the same
+question the opposite way: it **runs your tests** to show, with a concrete
+fault, what protection a change to them dropped.
 
 It is a separate package with its own command, kept outside checkwash as
-checkwash's satellite rule asks: it does not import checkwash, checkwash does
-not import it, and nothing in checkwash (`check`, the GitHub Action, the
-hooks) starts it. It runs only when you type `checkwash-prove`.
+checkwash's [satellite rule](https://github.com/taipei49314/checkwash/blob/main/docs/satellite-execution.md)
+asks: it does not import checkwash, checkwash does not import it, and nothing
+in checkwash (`check`, the GitHub Action, the hooks) starts it. It runs only
+when you type `checkwash-prove`.
 
-It is experimental and unreleased. Its options, output and exit codes may
-change in any version.
+It is experimental. Its options, output and exit codes may change in any
+version.
 
 ## Run it only on code you would run anyway
 
@@ -19,14 +21,13 @@ revisions, many times, with your privileges and no sandbox. Use it on your
 own checkout, on code you trust. Never point it at an untrusted pull request
 in CI: that is running the pull request's code. Do not make it a required
 check either: its result is a lead for a reviewer, not a merge verdict.
-[THREATMODEL.md](THREATMODEL.md) says what it does and does not protect.
+[THREATMODEL.md](https://github.com/taipei49314/checkwash-prove/blob/main/THREATMODEL.md)
+says what it does and does not protect.
 
 ## Install
 
-It is not on PyPI. From a checkout:
-
 ```
-pip install .
+pip install checkwash-prove
 ```
 
 It needs Python 3.11 or later and `git` on `PATH`. The interpreter that runs
@@ -212,7 +213,7 @@ run, a Git error or a crash included: never `1`.
   may have dropped that protection on purpose.
 - The code under test can tell it is being run by checkwash-prove, so a
   change written to defeat it can hide a loss. See
-  [THREATMODEL.md](THREATMODEL.md).
+  [THREATMODEL.md](https://github.com/taipei49314/checkwash-prove/blob/main/THREATMODEL.md).
 - It takes a pytest run at the repository root as the whole suite and
   counts only the tests that run collects. Changed test modules that pytest
   runs under another configuration file are noted; when the root run
@@ -251,7 +252,15 @@ pytest
 The tests build small Git repositories and run the real procedure on them,
 so they need `git` on `PATH` and take minutes, not seconds. Some are for one
 platform only (symlinks on POSIX, junctions and case-insensitive paths on
-Windows), so run them on each platform you rely on. There is no CI yet.
+Windows). CI runs them on Linux, Windows and macOS with every supported
+Python version. Changes are listed in
+[CHANGELOG.md](https://github.com/taipei49314/checkwash-prove/blob/main/CHANGELOG.md);
+[RELEASING.md](https://github.com/taipei49314/checkwash-prove/blob/main/RELEASING.md)
+says how a version reaches PyPI.
+
+## Reporting a vulnerability
+
+See [SECURITY.md](https://github.com/taipei49314/checkwash-prove/blob/main/SECURITY.md).
 
 ## License
 
