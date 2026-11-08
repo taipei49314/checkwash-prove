@@ -190,16 +190,19 @@ def pytest_runtest_logstart(nodeid, location):
     _mark("S", nodeid)
 
 
-@pytest.hookimpl(trylast=True)
-def pytest_runtest_setup(item):
+@pytest.hookimpl(tryfirst=True)
+def pytest_runtest_teardown(item, nextitem):
     # Fixtures that several tests share (class, module, package or session scope) end when their node is torn down,
-    # after the test's own fixtures. A finalizer added to each node now runs there before theirs: from that point a
-    # hang or a death belongs to the run, not to this test.
+    # after the test's own fixtures. A finalizer added now, before the teardown starts, to each node the next test
+    # does not share is the last added there, so it runs first: from that point a hang or a death belongs to the run,
+    # not to this test. Added at teardown, it is there even when the test's setup failed.
+    shared = set(nextitem.listchain()) if nextitem is not None else set()
     for node in item.listchain()[:-1]:
-        try:
-            node.addfinalizer(lambda nodeid=item.nodeid: _mark("W", nodeid))
-        except Exception:
-            pass
+        if node not in shared:
+            try:
+                node.addfinalizer(lambda nodeid=item.nodeid: _mark("W", nodeid))
+            except Exception:
+                pass
 
 
 def pytest_runtest_logfinish(nodeid, location):
@@ -347,7 +350,8 @@ def scope_dir(path: str) -> str:
     return "/".join(parts)
 
 
-_SECTION = re.compile(r"^\s*\[([^\]]+)\]\s*$")
+# A section header, which may end in a comment as pytest's ini parser allows (`[pytest]  ; ci settings`).
+_SECTION = re.compile(r"^\s*\[([^\]]+)\]\s*(?:[#;].*)?$")
 
 
 def _ini_section(text: str, section: str) -> str | None:
@@ -426,11 +430,11 @@ def pytest_version(python: str) -> tuple[int, ...] | None:
 
 def config_names_for(version: tuple[int, ...] | None) -> tuple[str, ...]:
     """The configuration files a pytest version looks for, in its order: pytest.toml and .pytest.toml from 9.0,
-    .pytest.ini from 7.1. With the version unknown, pytest 9's."""
+    .pytest.ini from 7.2. With the version unknown, pytest 9's."""
     names = CONFIG_NAMES
     if version is not None and version < (9, 0):
         names = tuple(n for n in names if n not in ("pytest.toml", ".pytest.toml"))
-    if version is not None and version < (7, 1):
+    if version is not None and version < (7, 2):
         names = tuple(n for n in names if n != ".pytest.ini")
     return names
 
@@ -514,14 +518,21 @@ def locate_config(tree: pathlib.Path, args: list[str], names: tuple[str, ...] = 
 # Git's variables that name a repository, an index or a work tree. A Git hook or alias that starts checkwash-prove
 # sets some of them (a pre-commit hook sets GIT_INDEX_FILE): they would point its own Git commands, and the Git
 # commands of the tests it runs in its temporary trees, at the caller's repository.
-GIT_LOCATION_VARIABLES = ("GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE", "GIT_OBJECT_DIRECTORY",
-                          "GIT_ALTERNATE_OBJECT_DIRECTORIES", "GIT_COMMON_DIR", "GIT_NAMESPACE", "GIT_PREFIX",
-                          "GIT_QUARANTINE_PATH")
+# Git's own list (`git rev-parse --local-env-vars`), which it clears when it enters another repository, the
+# configuration a parent `git -c` passes down included, plus the namespace and a pre-receive hook's quarantine.
+GIT_LOCATION_VARIABLES = ("GIT_ALTERNATE_OBJECT_DIRECTORIES", "GIT_CONFIG", "GIT_CONFIG_PARAMETERS",
+                          "GIT_CONFIG_COUNT", "GIT_OBJECT_DIRECTORY", "GIT_DIR", "GIT_WORK_TREE",
+                          "GIT_IMPLICIT_WORK_TREE", "GIT_GRAFT_FILE", "GIT_INDEX_FILE", "GIT_NO_REPLACE_OBJECTS",
+                          "GIT_REPLACE_REF_BASE", "GIT_PREFIX", "GIT_SHALLOW_FILE", "GIT_COMMON_DIR",
+                          "GIT_NAMESPACE", "GIT_QUARANTINE_PATH")
 
 
 def _clean_env(**extra: str) -> dict[str, str]:
-    """The caller's environment without Git's location variables, plus extra."""
-    env = {k: v for k, v in os.environ.items() if k.upper() not in GIT_LOCATION_VARIABLES}
+    """The caller's environment without Git's location variables (and the GIT_CONFIG_KEY_n / GIT_CONFIG_VALUE_n
+    pairs GIT_CONFIG_COUNT names), plus extra."""
+    env = {k: v for k, v in os.environ.items()
+           if k.upper() not in GIT_LOCATION_VARIABLES and not k.upper().startswith(("GIT_CONFIG_KEY_",
+                                                                                     "GIT_CONFIG_VALUE_"))}
     env.update(extra)
     return env
 
@@ -607,21 +618,41 @@ def _module_names(path: str) -> set[str]:
     return {dotted, dotted.rsplit(".", 1)[-1]}
 
 
-def _importers(repo: str, rev: str, changed: list[str],
-               naming: tuple[Naming, ...] = DEFAULT_NAMING) -> list[tuple[str, str]]:
+def _blobs(repo: str, rev: str, paths: list[str]) -> dict[str, bytes]:
+    """Many files of rev, read with one `git cat-file --batch`."""
+    paths = [p for p in paths if "\n" not in p]
+    if not paths:
+        return {}
+    data = _git(repo, "cat-file", "--batch", input="".join(f"{rev}:{p}\n" for p in paths).encode("utf-8"))
+    out, pos = {}, 0
+    for path in paths:
+        end = data.index(b"\n", pos)
+        header = data[pos:end].split()
+        pos = end + 1
+        if len(header) == 3 and header[1] == b"blob":       # "<name> missing" has nothing after it
+            size = int(header[2])
+            out[path] = data[pos:pos + size]
+            pos += size + 1
+    return out
+
+
+def _importers(repo: str, rev: str, changed: list[str], naming: tuple[Naming, ...] = DEFAULT_NAMING,
+               skip: frozenset[str] = frozenset()) -> list[tuple[str, str]]:
     """(unchanged test module, changed test module it imports) at rev, within the test directories of the changed
-    modules: a changed module can be a library of others (base classes, helpers)."""
+    modules: a changed module can be a library of others (base classes, helpers). `skip` names the modules the
+    range changed or added, which are compared themselves."""
     if not changed:
         return []
     wanted = {name: path for path in changed for name in _module_names(path)}
     dirs = sorted({scope_dir(p) for p in changed})
+    candidates = [p for p in tree_files(repo, rev, dirs)
+                  if p not in changed and p not in skip and is_test_module(p, naming)][:5000]
+    sources = _blobs(repo, rev, candidates)
     out = []
-    for path in tree_files(repo, rev, dirs):
-        if path in changed or not is_test_module(path, naming):
-            continue
+    for path in candidates:
         try:
-            tree = ast.parse(blob(repo, rev, path) or b"")
-        except (SyntaxError, ValueError):
+            tree = ast.parse(sources.get(path, b""))
+        except Exception:      # noqa: BLE001 - only a note depends on it: SyntaxError, a deep nesting, anything
             continue
         package = path.rsplit("/", 1)[0].replace("/", ".") if "/" in path else ""
         hits = set()
@@ -681,6 +712,15 @@ def _signature(st: os.stat_result) -> tuple[int, int, int, int]:
     return st.st_size, st.st_mtime_ns, stat.S_IMODE(st.st_mode), st.st_nlink
 
 
+def _lstat_signature(path: str) -> tuple[int, int, int, int]:
+    """An entry's signature; one that cannot be read (a directory a test left without its search permission) gets
+    a signature no pristine file has, so the reset puts it back."""
+    try:
+        return _signature(os.lstat(path))
+    except OSError:
+        return (-1, -1, -1, -1)
+
+
 def _scan(root: pathlib.Path) -> tuple[dict[str, tuple[int, int, int, int]], set[str]]:
     files: dict[str, tuple[int, int, int, int]] = {}
     dirs: set[str] = set()
@@ -690,13 +730,13 @@ def _scan(root: pathlib.Path) -> tuple[dict[str, tuple[int, int, int, int]], set
         for name in dirnames:
             rel = os.path.normpath(os.path.join(rel_dir, name))
             if _is_link(os.path.join(current, name)):
-                files[rel] = _signature(os.lstat(os.path.join(current, name)))
+                files[rel] = _lstat_signature(os.path.join(current, name))
             else:
                 dirs.add(rel)
                 keep.append(name)
         dirnames[:] = keep
         for name in filenames:
-            files[os.path.normpath(os.path.join(rel_dir, name))] = _signature(os.lstat(os.path.join(current, name)))
+            files[os.path.normpath(os.path.join(rel_dir, name))] = _lstat_signature(os.path.join(current, name))
     return files, dirs
 
 
@@ -771,19 +811,32 @@ def _owner_rwx(path: pathlib.Path) -> None:
             os.close(fd)
 
 
-def remove_workdir(work: pathlib.Path) -> None:
-    """Remove the work directory whatever the last run in each tree left: read-only files (Windows) and
-    directories without their owner's permissions (POSIX) are made removable first, never through a link."""
-    if os.name != "nt" and not os.path.islink(work):
-        _owner_rwx(work)
-    for current, dirnames, filenames in os.walk(work):
+def _dir_writable(path: pathlib.Path) -> None:
+    """One of the tree's own directories (never a link) made removable and writable again: on POSIX its owner's
+    permissions; on Windows its read-only attribute cleared, without which it cannot be removed."""
+    if os.name != "nt":
+        _owner_rwx(path)
+        return
+    try:
+        if (not _is_link(path)
+                and getattr(os.lstat(path), "st_file_attributes", 0) & stat.FILE_ATTRIBUTE_READONLY):
+            os.chmod(path, stat.S_IWRITE | stat.S_IREAD)
+    except OSError:
+        pass
+
+
+def _make_removable(root: pathlib.Path) -> None:
+    """What runs left under root that keeps it from being removed: a link or junction goes itself, never followed;
+    a directory is made writable; on Windows a read-only file is made writable when no hard link shares it."""
+    _dir_writable(root)
+    for current, dirnames, filenames in os.walk(root):
         for name in list(dirnames):
-            path = os.path.join(current, name)
+            path = pathlib.Path(current, name)
             if _is_link(path):
                 dirnames.remove(name)
-                _link_writable(pathlib.Path(path))
-            elif os.name != "nt":
-                _owner_rwx(pathlib.Path(path))
+                _remove(path)
+            else:
+                _dir_writable(path)
         if os.name == "nt":
             for name in filenames:
                 path = os.path.join(current, name)
@@ -793,6 +846,12 @@ def remove_workdir(work: pathlib.Path) -> None:
                         os.chmod(path, stat.S_IWRITE | stat.S_IREAD)
                 except OSError:
                     pass
+
+
+def remove_workdir(work: pathlib.Path) -> None:
+    """Remove the work directory whatever the last run in each tree left, never through a link."""
+    if not _is_link(work):
+        _make_removable(work)
     shutil.rmtree(work, ignore_errors=True)
 
 
@@ -806,15 +865,15 @@ class Tree:
 
     def _put_back(self) -> None:
         files, dirs = _scan(self.path)
-        if os.name != "nt":
-            # A directory a test left unwritable keeps what is in it; the tree's own directories, never a link's
-            # target, get their owner's permissions back.
-            for rel in [".", *dirs]:
-                _owner_rwx(self.path / rel)
+        # A directory a test left unwritable (POSIX) or read-only (Windows) keeps what is in it; the tree's own
+        # directories, never a link's target, are made writable again.
+        for rel in [".", *dirs]:
+            _dir_writable(self.path / rel)
         for rel, sig in files.items():
             if self.files.get(rel) != sig:
                 _remove(self.path / rel)
         for rel in sorted(dirs - self.dirs, key=lambda r: r.count(os.sep), reverse=True):
+            _make_removable(self.path / rel)
             shutil.rmtree(self.path / rel, ignore_errors=True)
         for rel, sig in self.files.items():
             if files.get(rel) != sig:
@@ -861,10 +920,24 @@ class Tree:
         if mutant is not None:
             # A new file put in place, not the old one rewritten: whatever else may share that file keeps its bytes.
             target = self.path / mutant.path
-            fresh = target.with_name(target.name + ".checkwash-prove-new")
-            fresh.write_bytes(mutant.apply((self.pristine / mutant.path).read_bytes()))
-            shutil.copymode(self.pristine / mutant.path, fresh)
-            os.replace(fresh, target)
+            data = mutant.apply((self.pristine / mutant.path).read_bytes())
+            fd, name = tempfile.mkstemp(dir=target.parent, prefix=".checkwash-prove-", suffix=".tmp")
+            fresh = pathlib.Path(name)
+            try:
+                with os.fdopen(fd, "wb") as fh:
+                    fh.write(data)
+                shutil.copymode(self.pristine / mutant.path, fresh)
+                os.replace(fresh, target)
+            except OSError:
+                # Windows refuses to replace a file another process holds open. With no other name sharing it,
+                # writing it in place reaches nothing else.
+                try:
+                    fresh.unlink()
+                except OSError:
+                    pass
+                if os.lstat(target).st_nlink != 1:
+                    raise
+                target.write_bytes(data)
 
 
 def junit_key(nodeid: str) -> tuple[str, str]:
@@ -1229,8 +1302,8 @@ def _killed(clean: RunResult, run: RunResult, collected: Collected | None = None
     plugin's progress lines name the test, or the test file being collected, that the run was in when it hung or
     died, and that one must count for the run to be a catch. A run that was in none failed as a whole, as CI's
     would. One in the teardown of fixtures that several tests share (class, module, package or session scope) failed
-    as a whole for the new tests and the whole suite (`ambiguous_counts`), and in the last test that used them for the
-    old tests. In a run of some of the suite's files (`subset`), exit 5, no test ran, is no catch: the whole suite runs
+    as a whole for the new tests and the whole suite (`ambiguous_counts`), and for the old tests in the last test of
+    that scope, the one whose teardown ends them. In a run of some of the suite's files (`subset`), exit 5, no test ran, is no catch: the whole suite runs
     others and passes.
 
     A test class whose collection fails now (a parameter id or a generated test the mutant broke) counts when the
@@ -1351,6 +1424,7 @@ class Collected:
     bases: set[tuple[str, str]]
     modules: set[str]
     dirs: set[str] = dataclasses.field(default_factory=set)
+    whole: bool = False      # the collection failed as a whole (pytest 7 for a directory's conftest.py)
 
     def holds(self, path: str) -> bool:
         """Whether the suite holds a test file: it collected it, failed to collect it or the directory above it, or
@@ -1369,9 +1443,9 @@ def _collect(runner: Runner, tree: Tree, opts: Options, *, old_side: bool) -> Co
     prefix = os.path.relpath(result.rootdir or tree.path, tree.path).replace(os.sep, "/")
     prefix = "" if prefix == "." else prefix + "/"
     # What failed to collect is the suite's too: its run fails on it, as an old module that no longer imports on the
-    # new code does. A directory fails as a whole when its conftest.py or __init__.py does not import; a test file
-    # that skips itself while it is collected is the suite's as well.
-    modules, dirs = [], set()
+    # new code does. A directory fails as a whole when its conftest.py or __init__.py does not import (pytest 7
+    # reports that as the session's, which leaves the whole collection unknown).
+    modules, dirs, whole = [], set(), False
     for nodeid in found["errors"]:
         path = nodeid.split("::")[0]
         if path.endswith(".py") and path.rsplit("/", 1)[-1] != "__init__.py":
@@ -1379,12 +1453,16 @@ def _collect(runner: Runner, tree: Tree, opts: Options, *, old_side: bool) -> Co
             continue
         if path.endswith(".py"):
             path = path.rsplit("/", 1)[0] if "/" in path else ""
+        whole = whole or not path
         dirs.add((prefix + path).rstrip("/") if path else prefix.rstrip("/"))
-    modules += [n.split("::")[0] for n in found.get("skipped", [])]
+    # An old test file that skips itself while it is collected is the old suite's: it does not run here, which is
+    # said as such. A new one that does protects nothing, as a skip never catches: the whole suite decides.
+    if old_side:
+        modules += [n.split("::")[0] for n in found.get("skipped", [])]
     keys = {_tree_key(junit_key(n), result.prefix) for n in nodeids}
     files = [n.split("::")[0] for n in nodeids] + modules
     return Collected({prefix + f for f in files}, keys, {(c, n.partition("[")[0]) for c, n in keys},
-                     {result.prefix + re.sub(r"\.py$", "", f.replace("/", ".")) for f in files}, dirs)
+                     {result.prefix + re.sub(r"\.py$", "", f.replace("/", ".")) for f in files}, dirs, whole)
 
 
 def node_id(tree: pathlib.Path, rootdir: pathlib.Path | None, classname: str, name: str) -> str:
@@ -1597,7 +1675,7 @@ def prove(repo: str, spec: str, opts: Options) -> dict:
     submodules = sorted(c.path for c in changes if c.gitlink)
     if submodules:
         report["notes"].append("submodules are not compared: " + ", ".join(submodules))
-    # The configuration files the tests' pytest reads: pytest.toml from pytest 9, .pytest.ini from pytest 7.1.
+    # The configuration files the tests' pytest reads: pytest.toml from pytest 9, .pytest.ini from pytest 7.2.
     version = pytest_version(opts.python)
     report["pytest_version"] = ".".join(map(str, version)) if version else None
     config_names = config_names_for(version)
@@ -1618,7 +1696,8 @@ def prove(repo: str, spec: str, opts: Options) -> dict:
                    {p for p in tree_files(repo, head, dirs) if is_test_module(p, naming)} - set(new_tests))
     # A changed test module can be a library too (base classes, helpers): the unchanged modules that import it keep
     # its old behaviour unchecked, since only changed modules are compared.
-    importers = _importers(repo, head, [c.path for c in modules if c.status == "M"], naming)
+    importers = _importers(repo, head, [c.path for c in modules if c.status == "M"], naming,
+                           frozenset(c.path for c in modules))
     if importers:
         report["notes"].append("unchanged test modules that import a changed test module are not compared, so what "
                                "they take from it is not checked: "
@@ -1659,8 +1738,9 @@ def prove(repo: str, spec: str, opts: Options) -> dict:
                 message = f"checkwash-prove: could not remove {work}"
         if message and sys.stderr is not None:
             try:
-                # In a finally block: a failed write here must not replace the report being returned.
-                sys.stderr.write(message + "\n")
+                # In a finally block: a failed write here must not replace the report being returned. Escaped like
+                # every other line on standard error (the path comes from the temporary directory's settings).
+                sys.stderr.write(visible(message) + "\n")
             except (OSError, ValueError):
                 pass
 
@@ -1747,6 +1827,11 @@ def _prove_in(work, runner, repo, base, head, opts, suite, old_tests, new_tests,
         if collected is None:
             report["notes"].append(f"the {side} tree's own test collection could not be read, so test modules it "
                                    "may exclude count as protection")
+        elif collected.whole:
+            # Nothing it holds is known, and in CI the whole suite fails: no comparison would mean anything.
+            report["status"] = (f"{side} tests do not run on the new code: the {side} suite's own collection fails "
+                                "as a whole (a conftest.py, an __init__.py or a plugin that does not import)")
+            return report
     # Only the modules each side's own whole-suite run collects are run. One the project excludes (collect_ignore,
     # --ignore, outside testpaths) protected nothing in CI, and named on the command line it would bring in its
     # directory's conftest.py and its fixtures, whose failures CI never sees.
@@ -1782,8 +1867,8 @@ def _prove_in(work, runner, repo, base, head, opts, suite, old_tests, new_tests,
     for side, names in (("old", left_out[0]), ("new", left_out[1])):
         if names:
             report["notes"].append(f"changed {side} test modules that the {side} suite (a pytest run at the repository "
-                                   "root) does not collect are not run, since they protect nothing in CI: "
-                                   + ", ".join(names[:5]))
+                                   "root) does not collect, or skips as a whole, are not run, since they protect "
+                                   "nothing in CI: " + ", ".join(names[:5]))
     if not old_tests:
         root_config = locate_config(clean_old.path, [], runner.config_names)
         if any(locate_config(clean_old.path, [t], runner.config_names) != root_config for t in left_out[0]):

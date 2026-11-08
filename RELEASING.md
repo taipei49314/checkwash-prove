@@ -36,6 +36,7 @@ Every release needs the maintainer's own approval of that one release.
    that the build job printed.
 
 If a job fails after the upload, use **Re-run failed jobs**, never
-**Re-run all jobs**: PyPI refuses the files it already has. A version on
-PyPI cannot be replaced. A broken release is yanked on PyPI and followed by
+**Re-run all jobs**: a rebuild need not be byte for byte the same, and PyPI
+refuses a different file under a name it already has. A version on PyPI
+cannot be replaced. A broken release is yanked on PyPI and followed by
 a new version.

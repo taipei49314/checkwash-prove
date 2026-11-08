@@ -168,7 +168,10 @@ def exit_code(report: dict, fail_on_loss: bool) -> int:
 
 
 def _seconds(text: str) -> float:
-    value = float(text)
+    try:
+        value = float(text)
+    except ValueError:
+        value = math.nan
     if not math.isfinite(value) or value <= 0:
         raise argparse.ArgumentTypeError(f"needs a number of seconds above 0, got {text!r}")
     return value
@@ -176,7 +179,10 @@ def _seconds(text: str) -> float:
 
 def _count(least: int):
     def parse(text: str) -> int:
-        value = int(text)
+        try:
+            value = int(text)
+        except ValueError:
+            value = least - 1
         if value < least:
             raise argparse.ArgumentTypeError(f"needs a whole number of at least {least}, got {text!r}")
         return value

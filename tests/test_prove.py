@@ -1475,6 +1475,57 @@ def test_a_hang_in_a_session_fixtures_teardown_is_no_loss(tmp_path, short_budget
     assert report["protection_losses"] == []
 
 
+def test_a_hang_in_shared_teardown_after_a_failed_setup_is_still_the_runs(tmp_path, short_budgets):
+    # test_known_bug's own setup fails (its fixture raises), so no hook of its setup ran: the shared teardown after
+    # it must still be the run's for the whole suite, which then catches the mutant.
+    zzz = (b"import pytest\n\n\n@pytest.fixture\ndef broken():\n    raise RuntimeError('broken')\n\n\n"
+           b"def test_known_bug(server, broken):\n    pass\n")
+    repo, base, head = _repo(
+        tmp_path,
+        {"pkg/__init__.py": b"", "pkg/calc.py": STOP, "tests/conftest.py": SERVER,
+         "tests/test_calc.py": STRONG.replace(b"test_square()", b"test_square(server)"), "tests/test_zzz.py": zzz},
+        {"tests/test_calc.py": WEAK},
+    )
+    report = _prove(repo, base, head, only="pkg/calc.py:8:8:SDL:1", timeout=1)
+
+    (row,) = report["mutation"]["rows"]
+    assert row["suite_caught_by"] == ["(timeout)"]
+    assert report["protection_losses"] == []
+
+
+def test_a_collection_that_fails_as_a_whole_is_said_not_to_run(tmp_path, monkeypatch):
+    # pytest 7 reports a directory's conftest.py that does not import as the session's error: the whole collection is
+    # then unknown, and CI's suite fails as a whole.
+    import checkwash_prove.engine as engine
+
+    collect = engine._collect
+
+    def whole_on_the_old_side(runner, tree, opts, *, old_side):
+        found = collect(runner, tree, opts, old_side=old_side)
+        if old_side:
+            found.whole = True
+        return found
+
+    monkeypatch.setattr(engine, "_collect", whole_on_the_old_side)
+    repo, base, head = _weakened(tmp_path)
+    report = _prove(repo, base, head)
+
+    assert report["status"].startswith("old tests do not run on the new code: the old suite's own collection fails")
+    assert exit_code(report, True) == 2
+
+
+def test_a_mutant_reaches_a_file_another_process_holds_open(tmp_path):
+    # Windows refuses to replace a file that is open; with no other name sharing it, it is written in place.
+    from checkwash_prove.engine import Candidate
+
+    pristine, _ = _pristine(tmp_path)
+    tree = Tree(pristine, tmp_path / "tree")
+    with open(tree.path / "conf.txt", "rb"):
+        tree.reset(Candidate("conf.txt:1:0:X:1", "conf.txt", "X", 1, "inside", "INSIDE", "w", 0, 6, b"INSIDE", 0))
+    assert (tree.path / "conf.txt").read_text() == "INSIDE"
+    assert sorted(p.name for p in tree.path.iterdir()) == ["conf.txt", "data"]
+
+
 def test_a_long_list_of_test_files_goes_through_the_allow_list(tmp_path, monkeypatch):
     # Past ARGS_LIMIT the files go to the plugin, which collects exactly them; the comparison is the same.
     monkeypatch.setattr("checkwash_prove.engine.ARGS_LIMIT", 1)
@@ -1600,6 +1651,22 @@ def test_a_new_directory_whose_conftest_does_not_import_makes_no_loss(tmp_path):
     assert exit_code(report, True) == 2
 
 
+def test_a_change_that_makes_a_test_file_skip_itself_is_a_loss(tmp_path):
+    # Skipping the whole file at collection is a classic way to drop protection: CI passes a skipped file, so the
+    # new file protects nothing and the whole new suite decides.
+    skip = b"import pytest\n\npytest.skip('not here', allow_module_level=True)\n\n"
+    repo, base, head = _repo(
+        tmp_path,
+        {"pkg/__init__.py": b"", "pkg/calc.py": SQUARE, "tests/test_calc.py": STRONG,
+         "tests/test_other.py": b"def test_other():\n    pass\n"},
+        {"tests/test_calc.py": skip + STRONG},
+    )
+    report = _prove(repo, base, head, only="pkg/calc.py:2:11:AORB:1")
+
+    assert _loss_ids(report) == ["pkg/calc.py:2:11:AORB:1"]
+    assert exit_code(report, True) == 1
+
+
 def test_a_test_file_that_skips_itself_while_collected_is_part_of_the_suite(tmp_path):
     skip = b"import pytest\n\npytest.skip('not here', allow_module_level=True)\n\n"
     repo, base, head = _repo(
@@ -1716,11 +1783,14 @@ def test_unchanged_modules_that_import_a_changed_test_module_are_noted(tmp_path)
         tmp_path,
         {"pkg/__init__.py": b"", "pkg/calc.py": SQUARE, "tests/__init__.py": b"", "tests/test_base.py": shared,
          "tests/test_impl.py": impl},
-        {"tests/test_base.py": shared.replace(b"square(3) == 9", b"square(2) == 4")},
+        {"tests/test_base.py": shared.replace(b"square(3) == 9", b"square(2) == 4"),
+         "tests/test_added.py": impl.replace(b"TestImpl", b"TestAdded")},
     )
     report = _prove(repo, base, head, list_only=True)
 
-    assert any("tests/test_impl.py (imports tests/test_base.py)" in n for n in report["notes"])
+    (note,) = [n for n in report["notes"] if "import a changed test module" in n]
+    assert "tests/test_impl.py (imports tests/test_base.py)" in note
+    assert "test_added" not in note      # an added module is compared itself
 
 
 def test_doctests_the_project_collects_are_noted_as_not_compared(tmp_path):
@@ -1759,6 +1829,31 @@ def test_a_hooks_git_variables_reach_neither_prove_nor_the_tests(tmp_path, monke
     assert _loss_ids(report) == ["pkg/calc.py:2:11:AORB:1"]
 
 
+@pytest.mark.parametrize("variables", [
+    {"GIT_CONFIG_PARAMETERS": "'init.defaultBranch=leaked'"},
+    {"GIT_CONFIG_COUNT": "1", "GIT_CONFIG_KEY_0": "init.defaultBranch", "GIT_CONFIG_VALUE_0": "leaked"},
+])
+def test_configuration_a_git_c_passes_down_never_reaches_the_tests(tmp_path, monkeypatch, variables):
+    # `git -c ...` running a hook passes its settings down in one of these forms. The tests' own repository would get
+    # them: here the branch name, which the test checks.
+    own_repo = (b"\n\ndef test_own_repository(tmp_path):\n    import subprocess\n\n"
+                b"    subprocess.run(['git', 'init', '-q', str(tmp_path)], check=True)\n"
+                b"    head = subprocess.run(['git', '-C', str(tmp_path), 'symbolic-ref', 'HEAD'],\n"
+                b"                          capture_output=True, text=True).stdout\n"
+                b"    assert 'leaked' not in head\n")
+    repo, base, head = _repo(
+        tmp_path,
+        {"pkg/__init__.py": b"", "pkg/calc.py": SQUARE, "tests/test_calc.py": STRONG + own_repo},
+        {"tests/test_calc.py": WEAK + own_repo},
+    )
+    for name, value in variables.items():
+        monkeypatch.setenv(name, value)
+    report = _prove(repo, base, head, only="pkg/calc.py:2:11:AORB:1")
+
+    assert report["needs_clarification"] == []
+    assert _loss_ids(report) == ["pkg/calc.py:2:11:AORB:1"]
+
+
 def test_a_file_a_test_hard_linked_elsewhere_is_replaced_not_written_into(tmp_path):
     from checkwash_prove.engine import Candidate
 
@@ -1772,6 +1867,24 @@ def test_a_file_a_test_hard_linked_elsewhere_is_replaced_not_written_into(tmp_pa
     assert outside.read_text() == "inside"
 
 
+def test_a_directory_a_test_left_read_only_or_unsearchable_is_put_back(tmp_path):
+    # Windows: a read-only directory cannot be removed until its attribute is cleared. POSIX: without its search
+    # permission nothing in it can be read, and the reset must not stop on that.
+    import stat as stat_
+
+    pristine, _ = _pristine(tmp_path)
+    tree = Tree(pristine, tmp_path / "tree")
+    (tree.path / "left").mkdir()
+    (tree.path / "left" / "f.txt").write_text("x")
+    os.chmod(tree.path / "left" / "f.txt", stat_.S_IREAD)
+    os.chmod(tree.path / "left", stat_.S_IREAD if os.name == "nt" else 0o444)
+    os.chmod(tree.path / "data", stat_.S_IREAD if os.name == "nt" else 0o444)
+    tree.reset()
+
+    assert not (tree.path / "left").exists()
+    assert (tree.path / "data" / "a.txt").read_text() == "inside"
+
+
 def test_the_work_directory_goes_whatever_the_last_run_left(tmp_path):
     from checkwash_prove.engine import remove_workdir
 
@@ -1779,16 +1892,28 @@ def test_the_work_directory_goes_whatever_the_last_run_left(tmp_path):
     (work / "a" / "b").mkdir(parents=True)
     (work / "a" / "b" / "f.txt").write_text("x")
     os.chmod(work / "a" / "b" / "f.txt", 0o444)
-    if os.name != "nt":
-        os.chmod(work / "a" / "b", 0o500)
+    os.chmod(work / "a" / "b", 0o500 if os.name != "nt" else 0o444)
+    # A link a test left goes itself; what it points at stays.
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (outside / "keep.txt").write_text("keep")
+    if os.name == "nt":
+        import _winapi
+
+        _winapi.CreateJunction(str(outside), str(work / "a" / "link"))
+    else:
+        os.symlink(outside, work / "a" / "link")
     remove_workdir(work)
 
     assert not work.exists()
+    assert (outside / "keep.txt").read_text() == "keep"
 
 
 @pytest.mark.parametrize(("version", "missing"), [
     ((9, 2), set()),
     ((8, 4), {"pytest.toml", ".pytest.toml"}),
+    ((7, 2), {"pytest.toml", ".pytest.toml"}),
+    ((7, 1), {"pytest.toml", ".pytest.toml", ".pytest.ini"}),
     ((7, 0), {"pytest.toml", ".pytest.toml", ".pytest.ini"}),
     (None, set()),
 ])
@@ -1813,6 +1938,8 @@ def test_ini_comment_lines_are_no_settings():
     text = "[pytest]\npython_files =\n    test_*.py\n    # *.py\n; addopts = --sw\n"
     assert _setting("pytest.ini", text, "python_files").split() == ["test_*.py"]
     assert _setting("pytest.ini", text, "addopts") is None
+    # A section header may end in a comment, as pytest's parser allows.
+    assert _setting("tox.ini", "[pytest] ; ci\npython_files = check_*.py\n", "python_files") == "check_*.py"
 
 
 def test_an_import_root_takes_the_trees_spelling(tmp_path):
@@ -1849,11 +1976,13 @@ def test_keep_says_where_the_trees_are(tmp_path, capsys):
 
 
 @pytest.mark.parametrize("option", [["--timeout", "nan"], ["--timeout", "0"], ["--suite-timeout", "-5"],
-                                    ["--workers", "0"], ["--max-mutants", "-1"]])
-def test_impossible_numbers_are_usage_errors(option):
+                                    ["--timeout", "abc"], ["--workers", "0"], ["--workers", "two"],
+                                    ["--max-mutants", "-1"]])
+def test_impossible_numbers_are_usage_errors(option, capsys):
     with pytest.raises(SystemExit) as raised:
         main(["HEAD~1..HEAD", *option])
     assert raised.value.code == 2
+    assert "needs a" in capsys.readouterr().err
 
 
 @pytest.mark.parametrize("setup", [

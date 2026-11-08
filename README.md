@@ -97,12 +97,13 @@ the test file it was collecting, and counts only when that one does; a run
 that was in none failed as a whole, as CI's would. One that hangs in the
 teardown of fixtures that several tests share (class, module, package or
 session scope) failed as a whole for the new tests and the whole suite, and
-in the last test that used them for the old tests. In a run of some of the suite's files, exit 5 (no test ran, every
+for the old tests in the last test of that class, module, package or
+session, the one whose teardown ends them. In a run of some of the suite's files, exit 5 (no test ran, every
 module skipped) is no catch: the whole suite runs other tests and passes. A
 test the mutant renamed (a parameter id computed from the product code)
 counts when the clean run passed its other instances, and a test class
-whose collection the mutant broke counts when the clean run passed any of
-its tests; with no clean result to go by, a test counts for the new tests
+whose collection the mutant broke counts when the clean run passed or
+skipped any of its tests; with no clean result to go by, a test counts for the new tests
 and not for the old, so an unclear result never makes a loss, though it can
 hide one. A loss is confirmed only when the same old test, or the old run
 as a whole, catches the mutant again. Every run starts from a pristine copy
@@ -195,7 +196,7 @@ checkwash-prove BASE..HEAD [--repo DIR] [--format term|json] [--out FILE]
 
 The tests run under the project's own pytest configuration, found as the
 pytest in `--python` finds it (`pytest.toml` and `.pytest.toml` only from
-pytest 9, `.pytest.ini` from pytest 7.1) but only inside the repository,
+pytest 9, `.pytest.ini` from pytest 7.2) but only inside the repository,
 never above it (with `--confcutdir` at the tree, so no `conftest.py` above
 it loads either). Git's variables that name a repository, an index or a
 work tree (`GIT_DIR`, `GIT_INDEX_FILE` and the like, which a Git hook sets)
