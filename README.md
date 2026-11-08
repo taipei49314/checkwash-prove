@@ -29,7 +29,7 @@ It is not on PyPI. From a checkout:
 pip install .
 ```
 
-It needs Python 3.11 or later and nothing else. The interpreter that runs
+It needs Python 3.11 or later and `git` on `PATH`. The interpreter that runs
 the tests (`--python`, by default the one running checkwash-prove) needs the
 project's test dependencies and pytest 7 or later.
 
@@ -40,21 +40,25 @@ For a range `BASE..HEAD`, or `BASE...HEAD` to compare from the merge base as
 base branch since will read as the branch's):
 
 1. It builds two trees: HEAD, and HEAD with the test-suite files the range
-   changed put back to BASE. Those are test modules, `conftest.py` files,
-   any file under a `test`, `tests` or `testing` directory (helpers, data),
-   and pytest configuration (`pytest.toml`, `pytest.ini`, `pyproject.toml`,
-   `tox.ini`, `setup.cfg`) when its pytest settings changed. Test files the
-   range added are left out of the old tree.
+   changed put back to BASE. Those are test modules (named as the
+   repository root's pytest configuration sets `python_files`, at either
+   revision; pytest's default, `test_*.py` and `*_test.py`, when it does
+   not), `conftest.py` files, any file under a `test`, `tests` or `testing`
+   directory (helpers, data), and pytest configuration (`pytest.toml`,
+   `pytest.ini`, `pyproject.toml`, `tox.ini`, `setup.cfg`) when its pytest
+   settings changed. Test files the range added are left out of the old
+   tree.
 2. It runs the **old** test modules against the **new** product code. An old
    test that fails there is listed under **needs clarification**: the
    behaviour changed, and only a person can say whether on purpose. It is
    never counted as a loss. An old test module that no longer imports is
    listed there too, and the other old tests still run. When the new version
    of the same test fails as well, the report says so: a broken environment
-   or a defect is then likelier than a deliberate change. When only helpers,
+   or a defect is then likelier than a deliberate change. When helpers,
    fixtures, data or configuration changed, the test modules they can affect
-   are compared: those under the outermost test directory above the changed
-   file, or under its own directory, that the project's own run collects.
+   are compared too, changed or not: those under the outermost test
+   directory above the changed file, or under its own directory, that each
+   side's own run collects.
 3. In separate traced runs (the runs it compares are not traced, so a test
    that measures its own time is not disturbed), it records the product
    lines the old tests execute and generates mutants on those lines from the
@@ -70,14 +74,22 @@ base branch since will read as the branch's):
    side).
 
 What counts as caught is what CI would fail: a test that passed on the clean
-code and fails, a module that stops importing, a run that dies, or a timeout.
-A skip is not. A module that did not import on the clean code catches
-nothing. checkwash-prove names test modules on the command line, so only a
-test that the project's own whole-suite collection holds counts: a module the
-project excludes (`collect_ignore`, `--ignore`, a deselection) protects
-nothing in CI. Every run starts from a pristine copy of its tree, checked
-after it is put back, so a file one test run leaves behind never reaches the
-next.
+code (or was skipped) and fails, a module that stops importing, a run that
+dies, or a timeout. A skip is not. A test that failed on the clean code, or
+a module that did not import there, catches nothing. checkwash-prove names
+test modules on the command line, so only a test that the project's own
+whole-suite collection holds counts: a module the project excludes
+(`collect_ignore`, `--ignore`, a deselection) protects nothing in CI. A run
+that hangs or dies is pinned to the test it was in, or the test file it was
+collecting, and counts only when that one does; a run that was in none
+failed as a whole. A test the mutant renamed (a parameter id computed from
+the product code) counts when the clean run passed its other instances;
+with no clean result to go by it counts for the new tests and not for the
+old, so an unclear result never makes a loss, though it can hide one. Every
+run starts from a
+pristine copy of its tree, checked after it is put back, so a file one test
+run leaves behind never reaches the next; a link or junction it leaves is
+removed without following it.
 
 Every loss comes with the command that replays it alone:
 
@@ -93,8 +105,9 @@ method-level operators (Ma and Offutt, description updated July 2016) mapped
 to Python, plus PY-ASRS, which replaces a compound assignment operator with
 any other in the set `+= -= *= @= /= //= %= **= <<= >>= &= ^= |=`.
 `src/checkwash_prove/mutops_v05m2.py` is that generator byte for byte, and
-checkwash-prove refuses to run when its SHA-256 differs from the frozen one.
-The report names the catalogue version and the hash it checked. A mutant id
+checkwash-prove refuses to run when its SHA-256 differs from the frozen one,
+and imports it only after that check. The report names the catalogue
+version, and the JSON report also the hash it checked. A mutant id
 names its file, position and operator, `path:line:column:OP:n` (`n` counts
 the mutants one operator makes at one place), so it does not depend on which
 lines a run traced; unless the path has unusual characters, it needs no
@@ -115,7 +128,8 @@ checkwash-prove BASE..HEAD [--repo DIR] [--format term|json] [--out FILE]
 - `--repo`: any directory of the Git repository. It runs from the
   repository root, and says so on standard error when `--repo` names a
   subdirectory.
-- `--list`: run the old and new tests once, then list every mutant with its
+- `--list`: do everything up to the mutants (the old and new tests' clean
+  and traced runs, both trees' collections), then list every mutant with its
   id in run order, without running any. Use an id with `--only`.
 - `--python`: the interpreter that runs the tests, with the project's test
   dependencies installed. The default is the one running checkwash-prove.
@@ -126,9 +140,11 @@ checkwash-prove BASE..HEAD [--repo DIR] [--format term|json] [--out FILE]
 - `--timeout` and `--suite-timeout`: a clean run gets at most
   `--suite-timeout` seconds (default 900); a run against a mutant gets three
   times its clean run's time plus 10 seconds, and never less than
-  `--timeout` (default 30). A timeout counts as caught: CI fails a run that
-  hangs.
-- `--max-mutants`: mutants on lines only the old tests execute run first, then
+  `--timeout` (default 30); a traced run gets ten times its clean run's time
+  plus 60 seconds, and never less than `--suite-timeout`. A timeout counts as
+  caught when the test it hung in counts: CI fails a run that hangs.
+- `--max-mutants` (default 200): the cap on mutants run.
+- Run order: mutants on lines only the old tests execute run first, then
   those on lines the range added or replaced, then the rest of the product
   files it changed, then everything else, and last those on lines that only
   old tests which do not pass on the new code ran (such a test cannot catch
@@ -152,23 +168,30 @@ checkwash-prove BASE..HEAD [--repo DIR] [--format term|json] [--out FILE]
 The tests run under the project's own pytest configuration, found as pytest
 finds it but only inside the repository, never above it (with
 `--confcutdir` at the tree, so no `conftest.py` above it loads either).
-They run in one process, in order and without coverage: checkwash-prove
-passes `-n 0` when the project's addopts distribute the run with
-pytest-xdist, `--no-cov` when they turn pytest-cov on, and `-p no:randomly`,
-gives each run a pytest cache of its own outside the tree, and clears
-`PYTEST_ADDOPTS`. A timeout, and the end of every run, ends what the run
-started: on Windows everything in the run's job object, on POSIX everything
-in its process group. A process a test starts in a session of its own
-(`setsid`) is out of reach on POSIX; if it changes the tree, the next reset
-reports it.
+They run in one process, in order, without coverage and past every failure:
+checkwash-prove passes `-n 0` when the project's addopts distribute the run
+with pytest-xdist, `--no-cov` when they turn pytest-cov on, `-p no:randomly`,
+`--maxfail=0` (over `-x` or `--maxfail` in addopts) and an empty
+`--junit-prefix`; it refuses to run when the addopts turn on `--stepwise`,
+which nothing turns off. It gives each run a pytest cache of its own outside
+the tree, and clears `PYTEST_ADDOPTS`. A timeout, and the end of every run,
+ends what the run started: on Windows everything in the run's job object, on
+POSIX everything in its process group. A process a test moves to a session
+or process group of its own (`setsid`, `setpgid`) is out of reach on POSIX;
+if it changes the tree, the next reset puts the tree back, and stops the run
+when it cannot within about five seconds.
 
 Exit codes: `0` when the report was produced. With `--fail-on-loss`: `1` when
-there is a loss; `2` when nothing could be compared (old or new tests that do
-not run, no mutants) or some of it could not be decided (a whole-suite result
-that could not be had, a loss that did not repeat alone); `0` when the range
-changes no test file, or every mutant run was decided without a loss. `2`
-also for a usage error or anything that stopped the run, a Git error or a
-crash included: never `1`.
+there is a loss; `2` when the comparison did not happen (old or new tests that
+do not run, no mutants, tests pytest runs under a configuration of their own
+that the root run does not collect) or some of it could not be decided (a
+whole-suite result that could not be had, a loss that did not repeat alone);
+`0` when every mutant run was decided without a loss, when the mutants were
+only listed, and for the three statuses that begin "nothing to compare": the
+range changes no test file, no test module that existed before the change is
+affected, or the old suite does not collect the changed old tests (they
+protected nothing). `2` also for a usage error or anything that stopped the
+run, a Git error or a crash included: never `1`.
 
 ## What the result does not say
 
@@ -184,12 +207,15 @@ crash included: never `1`.
   change written to defeat it can hide a loss. See
   [THREATMODEL.md](THREATMODEL.md).
 - It takes a pytest run at the repository root as the whole suite and
-  counts only the tests that run collects. Changed test modules with a
-  pytest configuration of their own are noted; when the root run collects
-  none of the changed old tests and some have one, the result is "not
-  compared".
-- When test modules changed, unchanged test modules that use a changed
-  helper or fixture are not compared; the report notes the helper.
+  counts only the tests that run collects. Changed test modules that pytest
+  runs under another configuration file are noted; when the root run
+  collects none of the changed old tests and some are such, the result is
+  "not compared".
+- Unchanged test modules are compared only through a changed helper,
+  fixture, data or configuration file under the same test directory; one
+  that imports a changed helper from elsewhere is not.
+- Test modules are found by the root configuration's `python_files`; a
+  `python_files` set in a configuration file below the root is not read.
 - A test that behaves differently from run to run can still mislead it; a
   loss that does not repeat alone is listed apart as unconfirmed.
 - Files under a directory named `test`, `tests` or `testing` count as test
@@ -207,8 +233,9 @@ pytest
 ```
 
 The tests build small Git repositories and run the real procedure on them,
-so they need `git` on `PATH` and take minutes, not seconds. They have been
-run on Windows (Python 3.11) and on Linux (Python 3.12). There is no CI yet.
+so they need `git` on `PATH` and take minutes, not seconds. Some are for one
+platform only (symlinks on POSIX, junctions and case-insensitive paths on
+Windows), so run them on each platform you rely on. There is no CI yet.
 
 ## License
 

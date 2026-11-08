@@ -15,6 +15,7 @@ import subprocess
 import sys
 
 from checkwash_prove import __version__
+from checkwash_prove._text import visible
 
 DEFAULT_TIMEOUT = 30.0
 DEFAULT_SUITE_TIMEOUT = 900.0
@@ -56,12 +57,16 @@ def write_machine(text: str) -> None:
     buffer.flush()
 
 
-def _advise(line: str) -> None:
-    """An advisory stderr line; it never reaches stdout or the exit code."""
+def _advise(text: str) -> None:
+    """Lines for standard error. They never reach stdout, where a closed stderr would send them ahead of a JSON
+    report, nor the exit code; and the repository's text in them (paths, pytest output, Git's messages) is escaped,
+    as in the text report, with a message's later lines marked as its continuation."""
     if sys.stderr is None:
         return
+    first, *rest = text.splitlines() or [""]
     try:
-        write_text(line, sys.stderr)
+        write_text("".join(line + "\n" for line in [visible(first), *("  | " + visible(r) for r in rest)]),
+                   sys.stderr)
     except (OSError, ValueError):
         pass
 
@@ -140,12 +145,13 @@ def exit_code(report: dict, fail_on_loss: bool) -> int:
         return 0
     categories = report.get("mutation", {}).get("categories", {})
     if not report.get("compared"):
-        write_text(f"{NAME}: not compared, so neither passed nor failed: {report.get('status')}\n", sys.stderr)
+        status = " | ".join(str(report.get("status")).splitlines())
+        _advise(f"{NAME}: not compared, so neither passed nor failed: {status}")
         return 2
     undecided = categories.get("undecided", 0) + categories.get("unconfirmed loss", 0)
     if undecided:
-        write_text(f"{NAME}: {undecided} mutant(s) could not be decided (undecided, or a loss that did not "
-                   "repeat alone), so neither passed nor failed\n", sys.stderr)
+        _advise(f"{NAME}: {undecided} mutant(s) could not be decided (undecided, or a loss that did not repeat "
+                "alone), so neither passed nor failed")
         return 2
     return 0
 
@@ -208,7 +214,7 @@ def run(args: argparse.Namespace) -> int:
     try:
         report = prove(args.repo, args.range, opts)
     except ProveError as exc:
-        write_text(f"error: {exc}\n", sys.stderr)
+        _advise(f"error: {exc}")
         return 2
     text = json.dumps(report, indent=2, ensure_ascii=False) + "\n"
     if args.out:
@@ -222,24 +228,30 @@ def run(args: argparse.Namespace) -> int:
 
 
 def _engine_error(detail: str) -> int:
-    _advise(f"{NAME} engine error: {detail}\n")
+    _advise(f"{NAME} engine error: {detail}")
     return 2
 
 
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
-    # The range is checked before Git is asked anything, so a malformed one is a usage error wherever it is typed.
-    usage = range_usage_error(args.range)
-    if usage:
-        write_text(usage, sys.stderr)
-        return 2
+    # Everything after parsing is inside the guard, the engine's import included: an uncaught exception exits 1,
+    # which --fail-on-loss means as a loss. argparse's own usage errors exit 2.
     try:
+        # The range is checked before Git is asked anything, so a malformed one is a usage error wherever it is typed.
+        usage = range_usage_error(args.range)
+        if usage:
+            _advise(usage)
+            return 2
         given = args.repo
         args.repo, prefix = repository_root(given)
         if prefix:
-            _advise(f"{NAME}: using the repository root {args.repo}, not its subdirectory {prefix}\n")
+            _advise(f"{NAME}: using the repository root {args.repo}, not its subdirectory {prefix}")
         return run(args)
     except (GitError, OSError, RecursionError) as exc:
         return _engine_error(str(exc))
     except Exception as exc:  # noqa: BLE001 - a crash must never read as a loss, which --fail-on-loss reports as 1
         return _engine_error(f"{type(exc).__name__}: {exc}")
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

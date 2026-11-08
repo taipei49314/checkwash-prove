@@ -12,24 +12,28 @@ branch behind main or HEAD's own pytest configuration is not; an old test the
 new code fails is "needs clarification"; and no mutants or no old tests is
 said as such, never as a clean result.
 """
+import ast
 import hashlib
 import io
 import json
 import os
 import pathlib
+import re
+import shlex
 import subprocess
 import sys
 
 import pytest
 
 import checkwash_prove
-from checkwash_prove.cli import exit_code, interpreter, main, range_usage_error
+from checkwash_prove.cli import GitError, exit_code, interpreter, main, range_usage_error, repository_root
 from checkwash_prove.engine import (
     CATALOGUE_SHA256,
     CATALOGUE_VERSION,
     Options,
     ProveError,
     RunResult,
+    _XDIST_OPTION,
     _killed,
     changed_lines,
     is_test_module,
@@ -37,6 +41,7 @@ from checkwash_prove.engine import (
     normalise_root,
     parse_range,
     prove,
+    python_file_patterns,
     render,
     verify_catalogue,
 )
@@ -601,7 +606,8 @@ def test_a_change_to_a_fixture_alone_is_compared_through_the_modules_that_use_it
     report = _prove(repo, base, head, only="pkg/calc.py:2:11:AORB:1")
 
     assert report["tests"] == {"old": ["tests/test_calc.py"], "new": ["tests/test_calc.py"]}
-    assert any(note.startswith("no test module changed") for note in report["notes"])
+    assert any(note.startswith("changed test helpers, data or configuration (tests/conftest.py) are compared "
+                               "through the test modules under tests") for note in report["notes"])
     assert _loss_ids(report) == ["pkg/calc.py:2:11:AORB:1"]
 
 
@@ -814,7 +820,7 @@ def test_tests_under_a_configuration_of_their_own_are_said_not_compared(tmp_path
     )
     report = _prove(repo, base, head)
 
-    assert report["status"].startswith("not compared: the changed old tests have a pytest configuration")
+    assert report["status"].startswith("not compared: pytest runs the changed old tests under a configuration file")
     assert exit_code(report, True) == 2
 
 
@@ -1007,3 +1013,350 @@ def test_a_loss_is_kept_only_when_it_repeats_alone(runs, category, confirmation)
              {"old": 1, "new": 1, "suite": 1})
 
     assert (row["category"], row["confirmation"]) == (category, confirmation)
+
+
+# ---- review round 1 of the satellite: what counts as caught ---------------------------------------------------------
+
+# A loop the old tests run: SDL on `i += 1` makes it hang.
+LOOP = (b"def square(x):\n    return x * x\n\n\ndef total(n):\n    i = 0\n    s = 0\n    while i < n:\n        s += i\n"
+        b"        i += 1\n    return s\n")
+HANG = "pkg/calc.py:10:8:SDL:1"
+TOTAL = b"from pkg.calc import total\n\n\ndef test_total():\n    assert total(4) == 6\n"
+
+
+@pytest.fixture
+def short_budgets(monkeypatch):
+    # A hang ends at its budget: three times the clean run plus the margin. A short margin keeps these tests quick.
+    monkeypatch.setattr("checkwash_prove.engine.TIMEOUT_MARGIN", 2.0)
+
+
+def test_a_hang_in_a_module_the_old_suite_excludes_is_no_catch(tmp_path, short_budgets):
+    # Named on the command line, test_legacy.py runs and hangs on the mutant; BASE's own run never collected it, so
+    # the timeout protected nothing in CI.
+    repo, base, head = _repo(
+        tmp_path,
+        {"pkg/__init__.py": b"", "pkg/calc.py": LOOP, "tests/conftest.py": b"collect_ignore = ['test_legacy.py']\n",
+         "tests/test_legacy.py": TOTAL, "tests/test_calc.py": STRONG},
+        {"tests/test_legacy.py": None, "tests/test_calc.py": WEAK},
+    )
+    report = _prove(repo, base, head, only=HANG, timeout=1)
+
+    (row,) = report["mutation"]["rows"]
+    assert row["old_caught_by"] is None
+    assert report["protection_losses"] == []
+
+
+def test_a_hang_in_an_old_test_that_fails_on_the_new_code_is_no_catch(tmp_path, short_budgets):
+    # test_total fails on the new code (needs clarification): its hanging on a mutant catches nothing.
+    old = STRONG + b"\n\ndef test_total():\n    from pkg.calc import total\n    assert total(4) == 6\n"
+    repo, base, head = _repo(
+        tmp_path,
+        {"pkg/__init__.py": b"", "pkg/calc.py": LOOP, "tests/test_calc.py": old},
+        {"pkg/calc.py": LOOP.replace(b"while i < n", b"while i <= n"), "tests/test_calc.py": STRONG},
+    )
+    report = _prove(repo, base, head, only=HANG, timeout=1)
+
+    assert [c["test"] for c in report["needs_clarification"]] == ["tests/test_calc.py::test_total"]
+    (row,) = report["mutation"]["rows"]
+    assert row["old_caught_by"] is None
+    assert report["protection_losses"] == []
+
+
+def test_a_hang_in_a_test_the_new_suite_ignores_does_not_hide_a_loss(tmp_path, short_budgets):
+    # HEAD's addopts ignore tests/test_calc.py. Named on the command line it still runs and hangs; CI's run never
+    # collects it, so the new suite does not catch the mutant.
+    repo, base, head = _repo(
+        tmp_path,
+        {"pkg/__init__.py": b"", "pkg/calc.py": LOOP, "tests/test_calc.py": TOTAL,
+         "tests/test_other.py": b"def test_nothing():\n    pass\n"},
+        {"tests/test_calc.py": TOTAL + b"\n", "pytest.ini": b"[pytest]\naddopts = --ignore=tests/test_calc.py\n"},
+    )
+    report = _prove(repo, base, head, only=HANG, timeout=1)
+
+    (row,) = report["mutation"]["rows"]
+    assert row["old_caught_by"] == ["tests.test_calc::test_total (timeout)"]
+    assert row["new_caught_by"] is None
+    assert _loss_ids(report) == [HANG]
+
+
+def test_a_failure_under_a_parameter_id_the_mutant_changed_still_catches(tmp_path):
+    # The parameter comes from the product code, so the mutant renames the test: test_limit[6] becomes
+    # test_limit[5]. The clean run passed its one instance, so the failure counts.
+    product = b"def limit(base):\n    return base * 3\n\n\nLIMIT = limit(2)\n"
+    test = (b"import pytest\n\nfrom pkg.calc import LIMIT\n\n\n@pytest.mark.parametrize('n', [LIMIT])\n"
+            b"def test_limit(n):\n    assert n == 6\n")
+    repo, base, head = _repo(
+        tmp_path,
+        {"pkg/__init__.py": b"", "pkg/calc.py": product, "tests/test_calc.py": test},
+        {"tests/test_calc.py": test.replace(b"n == 6", b"n > 0")},
+    )
+    report = _prove(repo, base, head, only="pkg/calc.py:2:11:AORB:1")
+
+    (loss,) = report["protection_losses"]
+    assert loss["old_caught_by"] == ["tests/test_calc.py::test_limit[5]"]
+
+
+def test_exitfirst_in_the_projects_options_does_not_hide_later_catches(tmp_path):
+    # With -x the old run would stop at test_label, which fails on the new code, before test_square catches.
+    product = b"def double(x):\n    return x * 2\n\n\ndef label():\n    return 'old'\n\n\ndef square(x):\n    return x * x\n"
+    test = (b"from pkg.calc import double, label, square\n\n\ndef test_double():\n    assert double(2) == 4\n\n\n"
+            b"def test_label():\n    assert label() == 'old'\n\n\ndef test_square():\n    assert square(3) == 9\n")
+    repo, base, head = _repo(
+        tmp_path,
+        {"pkg/__init__.py": b"", "pkg/calc.py": product, "tests/test_calc.py": test,
+         "pytest.ini": b"[pytest]\naddopts = -x\n"},
+        {"pkg/calc.py": product.replace(b"'old'", b"'new'"),
+         "tests/test_calc.py": test.replace(b"square(3) == 9", b"square(2) == 4").replace(b"'old'", b"'new'")},
+    )
+    report = _prove(repo, base, head, only="pkg/calc.py:10:11:AORB:1")
+
+    assert [c["test"] for c in report["needs_clarification"]] == ["tests/test_calc.py::test_label"]
+    assert _loss_ids(report) == ["pkg/calc.py:10:11:AORB:1"]
+
+
+def test_a_junit_prefix_in_the_projects_options_changes_nothing(tmp_path):
+    ini = b"[pytest]\naddopts = --junit-prefix=px\n"
+    repo, base, head = _repo(
+        tmp_path,
+        {"pkg/__init__.py": b"", "pkg/calc.py": SQUARE, "tests/test_calc.py": STRONG, "pytest.ini": ini},
+        {"tests/test_calc.py": WEAK},
+    )
+    report = _prove(repo, base, head, only="pkg/calc.py:2:11:AORB:1")
+
+    assert report["status"] == "done"
+    assert _loss_ids(report) == ["pkg/calc.py:2:11:AORB:1"]
+
+
+@pytest.mark.parametrize("option", ["--sw", "--stepwise-skip"])
+def test_stepwise_in_the_projects_options_is_refused(tmp_path, option):
+    # --stepwise-skip turns stepwise on as well.
+    ini = f"[pytest]\naddopts = {option}\n".encode()
+    repo, base, head = _repo(
+        tmp_path,
+        {"pkg/__init__.py": b"", "pkg/calc.py": SQUARE, "tests/test_calc.py": STRONG, "pytest.ini": ini},
+        {"tests/test_calc.py": WEAK},
+    )
+    with pytest.raises(ProveError, match="--stepwise"):
+        _prove(repo, base, head)
+
+
+@pytest.mark.parametrize(("options", "found"), [
+    ("-n 4", True), ("-n4", True), ("-nauto", True), ("-nlogical", True), ("-n auto", True),
+    ("--numprocesses=2", True), ("--dist loadfile", True), ("--tx 2*popen", True), ("-q --strict-markers", False),
+    ("-p no:xdist", False), ("--no-header", False),
+])
+def test_every_spelling_of_xdists_options_is_seen(options, found):
+    assert (_XDIST_OPTION.search(options) is not None) is found
+
+
+def test_test_files_are_the_ones_the_projects_python_files_names(tmp_path):
+    # pytest-django's style: test modules are tests.py.
+    ini = b"[pytest]\npython_files = tests.py test_*.py\n"
+    test = STRONG.replace(b"pkg.calc", b"myapp.calc")
+    repo, base, head = _repo(
+        tmp_path,
+        {"myapp/__init__.py": b"", "myapp/calc.py": SQUARE, "myapp/tests.py": test, "pytest.ini": ini},
+        {"myapp/tests.py": test.replace(b"square(3) == 9", b"square(2) == 4")},
+    )
+    report = _prove(repo, base, head, only="myapp/calc.py:2:11:AORB:1")
+
+    assert report["python_files"] == ["tests.py", "test_*.py"]
+    assert report["tests"] == {"old": ["myapp/tests.py"], "new": ["myapp/tests.py"]}
+    assert _loss_ids(report) == ["myapp/calc.py:2:11:AORB:1"]
+
+
+def test_python_files_set_at_one_revision_add_to_the_default_of_the_other(tmp_path):
+    repo, base, head = _repo(tmp_path, {"a.txt": b"a"}, {"pytest.ini": b"[pytest]\npython_files = tests.py\n"})
+    assert python_file_patterns(str(repo), (base, head)) == ("test_*.py", "*_test.py", "tests.py")
+    assert python_file_patterns(str(repo), (base,)) == ("test_*.py", "*_test.py")
+
+
+def test_a_helper_change_is_compared_even_when_a_test_module_is_added(tmp_path):
+    # The weakened helper serves the unchanged test_calc.py; adding test_new.py must not turn that into "nothing to
+    # compare".
+    test = b"from helpers import expected\nfrom pkg.calc import square\n\n\ndef test_square():\n    assert square(3) == expected()\n"
+    repo, base, head = _repo(
+        tmp_path,
+        {"pkg/__init__.py": b"", "pkg/calc.py": SQUARE, "tests/test_calc.py": test,
+         "tests/helpers.py": b"def expected():\n    return 9\n"},
+        {"tests/helpers.py": b"def expected():\n    from pkg.calc import square\n    return square(3)\n",
+         "tests/test_new.py": b"def test_new():\n    pass\n"},
+    )
+    report = _prove(repo, base, head, only="pkg/calc.py:2:11:AORB:1")
+
+    assert report["tests"] == {"old": ["tests/test_calc.py"], "new": ["tests/test_calc.py", "tests/test_new.py"]}
+    assert _loss_ids(report) == ["pkg/calc.py:2:11:AORB:1"]
+
+
+def test_a_package_with_a_pyproject_of_its_own_is_compared(tmp_path):
+    # pytest runs packages/foo's tests with packages/foo as rootdir (its pyproject.toml), and the root run with the
+    # repository root: the same tests, named from two places.
+    test = STRONG.replace(b"pkg.calc", b"foo.calc")
+    repo, base, head = _repo(
+        tmp_path,
+        {"packages/foo/pyproject.toml": b"[project]\nname = 'foo'\n", "packages/foo/src/foo/__init__.py": b"",
+         "packages/foo/src/foo/calc.py": SQUARE, "packages/foo/tests/test_calc.py": test},
+        {"packages/foo/tests/test_calc.py": test.replace(b"square(3) == 9", b"square(2) == 4")},
+    )
+    report = _prove(repo, base, head, import_root="packages/foo/src",
+                    only="packages/foo/src/foo/calc.py:2:11:AORB:1")
+
+    assert report["status"] == "done"
+    assert _loss_ids(report) == ["packages/foo/src/foo/calc.py:2:11:AORB:1"]
+
+
+# ---- review round 1 of the satellite: the trees, the command and its output -------------------------------------
+
+@pytest.mark.skipif(os.name == "nt", reason="symlinks need a privilege on Windows")
+def test_a_link_a_test_leaves_is_removed_without_touching_what_it_points_at(tmp_path):
+    outside = tmp_path / "outside"
+    (outside / "dir").mkdir(parents=True)
+    (outside / "dir" / "keep.txt").write_text("keep")
+    (outside / "file.sh").write_text("echo keep")
+    os.chmod(outside / "dir", 0o755)
+    os.chmod(outside / "file.sh", 0o755)
+    linker = (f"import os\n\n\ndef test_links():\n    if not os.path.lexists('dir_link'):\n"
+              f"        os.symlink({str(outside / 'dir')!r}, 'dir_link')\n"
+              f"        os.symlink({str(outside / 'file.sh')!r}, 'file_link')\n").encode()
+    repo, base, head = _repo(
+        tmp_path,
+        {"pkg/__init__.py": b"", "pkg/calc.py": SQUARE, "tests/test_calc.py": STRONG, "tests/test_links.py": linker},
+        {"tests/test_calc.py": WEAK},
+    )
+    report = _prove(repo, base, head, only="pkg/calc.py:2:11:AORB:1")
+
+    assert _loss_ids(report) == ["pkg/calc.py:2:11:AORB:1"]
+    assert oct(os.stat(outside / "dir").st_mode & 0o777) == oct(0o755)
+    assert oct(os.stat(outside / "file.sh").st_mode & 0o777) == oct(0o755)
+    assert (outside / "dir" / "keep.txt").read_text() == "keep"
+
+
+@pytest.mark.skipif(os.name != "nt", reason="junctions are Windows'")
+def test_a_junction_a_test_leaves_is_removed_without_emptying_its_target(tmp_path):
+    outside = tmp_path / "outside"
+    (outside / "sub").mkdir(parents=True)
+    (outside / "a.txt").write_text("keep")
+    (outside / "sub" / "b.txt").write_text("keep")
+    linker = (f"import _winapi\nimport os\n\n\ndef test_junction():\n    if not os.path.exists('junc'):\n"
+              f"        _winapi.CreateJunction({str(outside)!r}, 'junc')\n").encode()
+    repo, base, head = _repo(
+        tmp_path,
+        {"pkg/__init__.py": b"", "pkg/calc.py": SQUARE, "tests/test_calc.py": STRONG, "tests/test_junction.py": linker},
+        {"tests/test_calc.py": WEAK},
+    )
+    report = _prove(repo, base, head, only="pkg/calc.py:2:11:AORB:1")
+
+    assert _loss_ids(report) == ["pkg/calc.py:2:11:AORB:1"]
+    assert (outside / "a.txt").read_text() == "keep"
+    assert (outside / "sub" / "b.txt").read_text() == "keep"
+
+
+def test_the_repository_root_is_found_wherever_git_answers(tmp_path, monkeypatch):
+    monkeypatch.setenv("GIT_CEILING_DIRECTORIES", tmp_path.as_posix())
+    repo, base, head = _weakened(tmp_path)
+    assert repository_root(str(repo)) == (str(repo), "")
+    top, prefix = repository_root(str(repo / "tests"))
+    assert prefix == "tests/" and os.path.samefile(top, repo)
+    assert repository_root(str(repo / ".git")) == (str(repo / ".git"), "")
+    bare = tmp_path / "bare.git"
+    _git(tmp_path, "clone", "-q", "--bare", str(repo), str(bare))
+    assert repository_root(str(bare)) == (str(bare), "")
+    (tmp_path / "plain").mkdir()
+    with pytest.raises(GitError):
+        repository_root(str(tmp_path / "plain"))
+
+
+def test_an_error_before_git_is_asked_still_exits_2(monkeypatch, capsys):
+    # The engine's import, a damaged catalogue's included, happens inside the guard.
+    def broken(spec):
+        raise ImportError("damaged")
+
+    monkeypatch.setattr("checkwash_prove.cli.range_usage_error", broken)
+    assert main(["HEAD~1..HEAD", "--fail-on-loss"]) == 2
+    assert "checkwash-prove engine error: ImportError: damaged" in capsys.readouterr().err
+
+
+def test_the_catalogue_is_not_imported_until_its_hash_is_checked():
+    code = "import sys, checkwash_prove.cli, checkwash_prove.engine\nprint('checkwash_prove.mutops_v05m2' in sys.modules)\n"
+    proc = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, check=True)
+    assert proc.stdout.strip() == "False"
+
+
+def test_standard_error_lines_never_reach_standard_output(monkeypatch, capsys):
+    monkeypatch.setattr(sys, "stderr", None)
+    assert main(["HEAD"]) == 2
+    assert exit_code({"protection_losses": [], "status": "no mutants: x"}, True) == 2
+    assert capsys.readouterr().out == ""
+
+
+def test_standard_error_escapes_what_the_repository_controls(capsys):
+    status = "old tests do not run on the new code (pytest exit 2): \x1b]0;TITLE\x07\nE   boom"
+    assert exit_code({"protection_losses": [], "status": status}, True) == 2
+    err = capsys.readouterr().err
+    assert "\x1b" not in err and "\x07" not in err
+    assert "\\u001b]0;TITLE\\u0007 | E   boom" in err
+
+
+def test_the_text_report_keeps_joiners_and_marks_continuation_lines():
+    report = {
+        "catalogue": {"version": CATALOGUE_VERSION}, "base": "a" * 40, "head": "b" * 40, "from_merge_base": False,
+        "tests": {"old": [], "new": []}, "status": "old tests do not run on the new code (pytest exit 2): E   one\nE   two",
+        "needs_clarification": [{"test": "tests/test_x.py::test_\U0001f468\u200d\U0001f469", "reason": "r",
+                                 "detail": ""}],
+        "protection_losses": [], "unconfirmed_losses": [], "mutation": {}, "notes": ["n\U000e0041"],
+    }
+    lines = render(report).splitlines()
+
+    assert "status: old tests do not run on the new code (pytest exit 2): E   one" in lines
+    assert "  | E   two" in lines
+    assert "  - tests/test_x.py::test_\U0001f468\u200d\U0001f469: r" in lines
+    assert "note: n\\U000e0041" in lines
+
+
+def test_python_dash_m_of_either_module_returns_mains_exit_code():
+    for module in ("checkwash_prove", "checkwash_prove.cli"):
+        proc = subprocess.run([sys.executable, "-m", module, "HEAD"], capture_output=True, text=True)
+        assert proc.returncode == 2, module
+        assert "needs a range BASE..HEAD or BASE...HEAD" in proc.stderr
+
+
+def test_no_module_of_the_package_imports_checkwash():
+    # Imports inside functions too, which loading the modules would not show.
+    root = pathlib.Path(checkwash_prove.__file__).parent
+    found = []
+    for path in sorted(root.glob("*.py")):
+        for node in ast.walk(ast.parse(path.read_text(encoding="utf-8"))):
+            if isinstance(node, ast.Import):
+                names = [a.name for a in node.names]
+            elif isinstance(node, ast.ImportFrom) and not node.level:
+                names = [node.module or ""]
+            elif isinstance(node, ast.Constant) and isinstance(node.value, str):
+                names = [node.value] if re.fullmatch(r"checkwash(\.[\w.]+)?", node.value) else []  # import_module()
+            else:
+                names = []
+            found += [f"{path.name}: {n}" for n in names if n == "checkwash" or n.startswith("checkwash.")]
+    assert found == []
+
+
+def test_a_subdirectory_of_a_src_layout_runs_from_the_root(tmp_path, capsys):
+    # Left in the subdirectory, ls-tree would see no src/ and the import root, the test files and the changed lines
+    # would all be wrong.
+    test = STRONG
+    repo, base, head = _repo(
+        tmp_path,
+        {"src/pkg/__init__.py": b"", "src/pkg/calc.py": SQUARE, "tests/test_calc.py": test},
+        {"tests/test_calc.py": WEAK},
+    )
+    code = main([f"{base}..{head}", "--repo", str(repo / "src" / "pkg"), "--format", "json",
+                 "--only", "src/pkg/calc.py:2:11:AORB:1", "--fail-on-loss"])
+    captured = capsys.readouterr()
+
+    assert code == 1
+    (loss,) = json.loads(captured.out)["protection_losses"]
+    assert loss["id"] == "src/pkg/calc.py:2:11:AORB:1"
+    assert f"--repo {_quote_path(os.path.realpath(repo))} " in loss["replay"]
+    assert "not its subdirectory src/pkg/" in captured.err
+
+
+def _quote_path(path):
+    return subprocess.list2cmdline([path]) if os.name == "nt" else shlex.quote(path)
