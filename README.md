@@ -54,11 +54,11 @@ base branch since will read as the branch's):
    never counted as a loss. An old test module that no longer imports is
    listed there too, and the other old tests still run. When the new version
    of the same test fails as well, the report says so: a broken environment
-   or a defect is then likelier than a deliberate change. When helpers,
-   fixtures, data or configuration changed, the test modules they can affect
-   are compared too, changed or not: those under the outermost test
-   directory above the changed file, or under its own directory, that each
-   side's own run collects.
+   or a defect is then likelier than a deliberate change. When only
+   helpers, fixtures, data or configuration changed (perhaps with test
+   modules added), the test modules they can affect are compared: those
+   under the outermost test directory above the changed file, or under its
+   own directory, that each side's own run collects.
 3. In separate traced runs (the runs it compares are not traced, so a test
    that measures its own time is not disturbed), it records the product
    lines the old tests execute and generates mutants on those lines from the
@@ -218,9 +218,12 @@ run, a Git error or a crash included: never `1`.
   runs under another configuration file are noted; when the root run
   collects none of the changed old tests and some are such, the result is
   "not compared".
-- Unchanged test modules are compared only through a changed helper,
-  fixture, data or configuration file under the same test directory; one
-  that imports a changed helper from elsewhere is not.
+- When test modules that existed before changed, only those are compared:
+  an unchanged module that uses a changed helper or fixture is not (under a
+  changed `conftest.py`, comparing them would run the whole suite against
+  every mutant); the report notes the helper. With no such change,
+  unchanged modules are compared only through a changed file under the same
+  test directory; one that imports a changed helper from elsewhere is not.
 - Test modules are found by the root configuration's `python_files` and
   `testpaths`; one set in a configuration file below the root is not read.
   A pattern that also matches product modules makes them test files, never

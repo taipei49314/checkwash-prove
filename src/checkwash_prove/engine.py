@@ -1393,18 +1393,23 @@ def prove(repo: str, spec: str, opts: Options) -> dict:
     others = [c for c in suite if not is_test_module(c.path, naming)]
     old_tests = sorted(c.path for c in modules if c.status != "A")
     new_tests = sorted(c.path for c in modules if c.status != "D")
-    # Unchanged test modules that a changed helper, data or configuration file can affect; each side keeps only those
-    # its own whole-suite run collects (_prove_in).
+    # When no test module that existed before changed (only helpers, data or configuration, perhaps with added
+    # modules), the change is compared through the unchanged modules a changed file can affect; each side keeps only
+    # those its own whole-suite run collects (_prove_in). When existing modules changed too, those are compared, and
+    # the unchanged ones are not: under a changed conftest.py that would be the whole suite on every run.
     through: tuple[set[str], set[str]] = (set(), set())
-    if others:
+    if others and all(c.status == "A" for c in modules):
         dirs = sorted({scope_dir(c.path) for c in others})
         through = ({p for p in tree_files(repo, base, dirs) if is_test_module(p, naming)} - set(old_tests),
                    {p for p in tree_files(repo, head, dirs) if is_test_module(p, naming)} - set(new_tests))
         old_tests, new_tests = sorted(set(old_tests) | through[0]), sorted(set(new_tests) | through[1])
+        report["notes"].append("no test module that existed before changed; the changed test files ("
+                               + ", ".join(c.path for c in others) + ") are compared through the test modules under "
+                               + ", ".join(d or "the repository root" for d in dirs))
+    elif others:
         report["notes"].append("changed test helpers, data or configuration (" + ", ".join(c.path for c in others)
-                               + ") are compared through the test modules under "
-                               + ", ".join(d or "the repository root" for d in dirs)
-                               + (", as well as the changed test modules" if modules else ""))
+                               + "): test modules the range did not change are not compared, though some may use "
+                                 "them")
     product = sorted(c.path for c in changes if not c.gitlink and c.status != "D" and c.path.endswith(".py")
                      and not is_test_path(c.path, naming))
     report.update({"tests": {"old": old_tests, "new": new_tests}, "test_suite_files_changed": [c.path for c in suite],

@@ -610,8 +610,9 @@ def test_a_change_to_a_fixture_alone_is_compared_through_the_modules_that_use_it
     report = _prove(repo, base, head, only="pkg/calc.py:2:11:AORB:1")
 
     assert report["tests"] == {"old": ["tests/test_calc.py"], "new": ["tests/test_calc.py"]}
-    assert any(note.startswith("changed test helpers, data or configuration (tests/conftest.py) are compared "
-                               "through the test modules under tests") for note in report["notes"])
+    assert any(note.startswith("no test module that existed before changed; the changed test files "
+                               "(tests/conftest.py) are compared through the test modules under tests")
+               for note in report["notes"])
     assert _loss_ids(report) == ["pkg/calc.py:2:11:AORB:1"]
 
 
