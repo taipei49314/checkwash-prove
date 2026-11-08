@@ -42,12 +42,12 @@ base branch since will read as the branch's):
 1. It builds two trees: HEAD, and HEAD with the test-suite files the range
    changed put back to BASE. Those are test modules (named as the
    repository root's pytest configuration sets `python_files`, at either
-   revision; pytest's default, `test_*.py` and `*_test.py`, when it does
-   not), `conftest.py` files, any file under a `test`, `tests` or `testing`
-   directory (helpers, data), and pytest configuration (`pytest.toml`,
-   `pytest.ini`, `pyproject.toml`, `tox.ini`, `setup.cfg`) when its pytest
-   settings changed. Test files the range added are left out of the old
-   tree.
+   revision, pytest's default `test_*.py` and `*_test.py` when it does not,
+   and under its `testpaths` when it sets them), `conftest.py` files, any
+   file under a `test`, `tests` or `testing` directory (helpers, data), and
+   pytest configuration (`pytest.toml`, `pytest.ini`, `pyproject.toml`,
+   `tox.ini`, `setup.cfg`) when its pytest settings changed. Test files the
+   range added are left out of the old tree.
 2. It runs the **old** test modules against the **new** product code. An old
    test that fails there is listed under **needs clarification**: the
    behaviour changed, and only a person can say whether on purpose. It is
@@ -77,12 +77,18 @@ What counts as caught is what CI would fail: a test that passed on the clean
 code (or was skipped) and fails, a module that stops importing, a run that
 dies, or a timeout. A skip is not. A test that failed on the clean code, or
 a module that did not import there, catches nothing. checkwash-prove names
-test modules on the command line, so only a test that the project's own
-whole-suite collection holds counts: a module the project excludes
-(`collect_ignore`, `--ignore`, a deselection) protects nothing in CI. A run
-that hangs or dies is pinned to the test it was in, or the test file it was
-collecting, and counts only when that one does; a run that was in none
-failed as a whole. A test the mutant renamed (a parameter id computed from
+test modules on the command line, so it runs only the changed modules each
+side's own whole-suite collection holds: a module the project excludes
+(`collect_ignore`, `--ignore`, outside `testpaths`) protected nothing in CI,
+and its directory's `conftest.py` and fixtures never load there; the report
+notes it. Within a run, only a test that collection holds counts (a
+deselected one does not). A run that hangs or dies is pinned to the test it
+was in, or the test file it was collecting, and counts only when that one
+does; a run that was in none, or in a teardown that ends module- or
+session-scoped fixtures, failed as a whole, as CI's would. In a run of some
+of the suite's files, exit 5 (no test ran, every module skipped) is no
+catch: the whole suite runs other tests and passes. A test the mutant
+renamed (a parameter id computed from
 the product code) counts when the clean run passed its other instances;
 with no clean result to go by it counts for the new tests and not for the
 old, so an unclear result never makes a loss, though it can hide one. Every
@@ -172,8 +178,8 @@ They run in one process, in order, without coverage and past every failure:
 checkwash-prove passes `-n 0` when the project's addopts distribute the run
 with pytest-xdist, `--no-cov` when they turn pytest-cov on, `-p no:randomly`,
 `--maxfail=0` (over `-x` or `--maxfail` in addopts) and an empty
-`--junit-prefix`; it refuses to run when the addopts turn on `--stepwise`,
-which nothing turns off. It gives each run a pytest cache of its own outside
+`--junit-prefix`; it refuses to run when the addopts turn on `--stepwise`
+(`--sw`, `--sw-skip`, `--sw-reset`), which nothing turns off. It gives each run a pytest cache of its own outside
 the tree, and clears `PYTEST_ADDOPTS`. A timeout, and the end of every run,
 ends what the run started: on Windows everything in the run's job object, on
 POSIX everything in its process group. A process a test moves to a session
@@ -184,7 +190,8 @@ when it cannot within about five seconds.
 Exit codes: `0` when the report was produced. With `--fail-on-loss`: `1` when
 there is a loss; `2` when the comparison did not happen (old or new tests that
 do not run, no mutants, tests pytest runs under a configuration of their own
-that the root run does not collect) or some of it could not be decided (a
+that the root run does not collect, test files one pytest run cannot name
+together) or some of it could not be decided (a
 whole-suite result that could not be had, a loss that did not repeat alone);
 `0` when every mutant run was decided without a loss, when the mutants were
 only listed, and for the three statuses that begin "nothing to compare": the
@@ -214,8 +221,14 @@ run, a Git error or a crash included: never `1`.
 - Unchanged test modules are compared only through a changed helper,
   fixture, data or configuration file under the same test directory; one
   that imports a changed helper from elsewhere is not.
-- Test modules are found by the root configuration's `python_files`; a
-  `python_files` set in a configuration file below the root is not read.
+- Test modules are found by the root configuration's `python_files` and
+  `testpaths`; one set in a configuration file below the root is not read.
+  A pattern that also matches product modules makes them test files, never
+  mutated.
+- One pytest run names every test file of a side. When pytest would run them
+  from a package's own rootdir (its configuration or `pyproject.toml`) and
+  some lie outside it, the result is "not compared": compare the parts in
+  separate ranges.
 - A test that behaves differently from run to run can still mislead it; a
   loss that does not repeat alone is listed apart as unconfirmed.
 - Files under a directory named `test`, `tests` or `testing` count as test

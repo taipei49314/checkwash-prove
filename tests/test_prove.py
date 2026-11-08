@@ -20,6 +20,7 @@ import os
 import pathlib
 import re
 import shlex
+import shutil
 import subprocess
 import sys
 
@@ -40,8 +41,11 @@ from checkwash_prove.engine import (
     is_test_path,
     normalise_root,
     parse_range,
+    Naming,
+    Tree,
+    _shown,
+    naming_rules,
     prove,
-    python_file_patterns,
     render,
     verify_catalogue,
 )
@@ -1030,20 +1034,38 @@ def short_budgets(monkeypatch):
     monkeypatch.setattr("checkwash_prove.engine.TIMEOUT_MARGIN", 2.0)
 
 
-def test_a_hang_in_a_module_the_old_suite_excludes_is_no_catch(tmp_path, short_budgets):
-    # Named on the command line, test_legacy.py runs and hangs on the mutant; BASE's own run never collected it, so
-    # the timeout protected nothing in CI.
+def test_a_module_the_old_suite_excludes_is_not_run_at_all(tmp_path):
+    # BASE's own run never collected test_legacy.py, so it protected nothing in CI. Named on the command line it would
+    # run, and its hang on the loop's mutant read as a catch; it is left out, with its lines and its mutants.
     repo, base, head = _repo(
         tmp_path,
         {"pkg/__init__.py": b"", "pkg/calc.py": LOOP, "tests/conftest.py": b"collect_ignore = ['test_legacy.py']\n",
          "tests/test_legacy.py": TOTAL, "tests/test_calc.py": STRONG},
         {"tests/test_legacy.py": None, "tests/test_calc.py": WEAK},
     )
-    report = _prove(repo, base, head, only=HANG, timeout=1)
+    report = _prove(repo, base, head, list_only=True)
+
+    assert report["tests"] == {"old": ["tests/test_calc.py"], "new": ["tests/test_calc.py"]}
+    assert any("not run, since they protect nothing in CI: tests/test_legacy.py" in n for n in report["notes"])
+    assert HANG not in [c["id"] for c in report["mutation"]["candidates"]]
+
+
+def test_a_conftest_of_an_excluded_directory_never_loads(tmp_path):
+    # tests/legacy is excluded; its conftest.py runs the product at import. Had prove named the legacy module, every
+    # mutant that breaks that import would have been a catch the project's CI never makes.
+    legacy_conftest = b"from pkg.calc import square\n\nassert square(3) == 9\n"
+    repo, base, head = _repo(
+        tmp_path,
+        {"pkg/__init__.py": b"", "pkg/calc.py": SQUARE, "tests/conftest.py": b"collect_ignore = ['legacy']\n",
+         "tests/legacy/conftest.py": legacy_conftest, "tests/legacy/test_legacy.py": b"def test_old():\n    pass\n",
+         "tests/test_calc.py": STRONG.replace(b"square(3) == 9", b"square(1) == 1")},
+        {"tests/legacy/test_legacy.py": None, "tests/test_calc.py": STRONG.replace(b"square(3) == 9", b"square(1) > 0")},
+    )
+    report = _prove(repo, base, head, only="pkg/calc.py:2:11:AORB:2")
 
     (row,) = report["mutation"]["rows"]
-    assert row["old_caught_by"] is None
-    assert report["protection_losses"] == []
+    assert row["old_caught_by"] == ["tests.test_calc::test_square"]
+    assert report["tests"]["old"] == ["tests/test_calc.py"]
 
 
 def test_a_hang_in_an_old_test_that_fails_on_the_new_code_is_no_catch(tmp_path, short_budgets):
@@ -1127,9 +1149,9 @@ def test_a_junit_prefix_in_the_projects_options_changes_nothing(tmp_path):
     assert _loss_ids(report) == ["pkg/calc.py:2:11:AORB:1"]
 
 
-@pytest.mark.parametrize("option", ["--sw", "--stepwise-skip"])
+@pytest.mark.parametrize("option", ["--sw", "--stepwise-skip", "--sw-reset"])
 def test_stepwise_in_the_projects_options_is_refused(tmp_path, option):
-    # --stepwise-skip turns stepwise on as well.
+    # --stepwise-skip and --sw-reset turn stepwise on as well.
     ini = f"[pytest]\naddopts = {option}\n".encode()
     repo, base, head = _repo(
         tmp_path,
@@ -1143,7 +1165,8 @@ def test_stepwise_in_the_projects_options_is_refused(tmp_path, option):
 @pytest.mark.parametrize(("options", "found"), [
     ("-n 4", True), ("-n4", True), ("-nauto", True), ("-nlogical", True), ("-n auto", True),
     ("--numprocesses=2", True), ("--dist loadfile", True), ("--tx 2*popen", True), ("-q --strict-markers", False),
-    ("-p no:xdist", False), ("--no-header", False),
+    ("-vn2", True), ("-qn auto", True), ("-xn2", True),
+    ("-p no:xdist", False), ("--no-header", False), ("-knot_slow", False), ("-m network", False),
 ])
 def test_every_spelling_of_xdists_options_is_seen(options, found):
     assert (_XDIST_OPTION.search(options) is not None) is found
@@ -1160,15 +1183,33 @@ def test_test_files_are_the_ones_the_projects_python_files_names(tmp_path):
     )
     report = _prove(repo, base, head, only="myapp/calc.py:2:11:AORB:1")
 
-    assert report["python_files"] == ["tests.py", "test_*.py"]
+    assert report["test_file_naming"] == [{"python_files": ["tests.py", "test_*.py"], "testpaths": []}]
     assert report["tests"] == {"old": ["myapp/tests.py"], "new": ["myapp/tests.py"]}
     assert _loss_ids(report) == ["myapp/calc.py:2:11:AORB:1"]
 
 
+def test_a_broad_python_files_reaches_only_the_testpaths(tmp_path):
+    # `python_files = *.py` would name the product modules too; pytest's own run looks only under testpaths.
+    ini = b"[pytest]\npython_files = *.py\ntestpaths = tests\n"
+    repo, base, head = _repo(
+        tmp_path,
+        {"pkg/__init__.py": b"", "pkg/calc.py": SQUARE, "tests/check_calc.py": STRONG, "pytest.ini": ini},
+        {"tests/check_calc.py": WEAK, "pkg/calc.py": SQUARE + b"\n"},
+    )
+    report = _prove(repo, base, head, only="pkg/calc.py:2:11:AORB:1")
+
+    assert report["product_files_changed"] == ["pkg/calc.py"]
+    assert _loss_ids(report) == ["pkg/calc.py:2:11:AORB:1"]
+
+
 def test_python_files_set_at_one_revision_add_to_the_default_of_the_other(tmp_path):
-    repo, base, head = _repo(tmp_path, {"a.txt": b"a"}, {"pytest.ini": b"[pytest]\npython_files = tests.py\n"})
-    assert python_file_patterns(str(repo), (base, head)) == ("test_*.py", "*_test.py", "tests.py")
-    assert python_file_patterns(str(repo), (base,)) == ("test_*.py", "*_test.py")
+    repo, base, head = _repo(tmp_path, {"a.txt": b"a"},
+                             {"pytest.ini": b"[pytest]\npython_files = tests.py\ntestpaths = app\n"})
+    assert naming_rules(str(repo), (base, head)) == (Naming(), Naming(("tests.py",), ("app",)))
+    assert naming_rules(str(repo), (base,)) == (Naming(),)
+    rules = naming_rules(str(repo), (base, head))
+    assert is_test_module("app/tests.py", rules) and is_test_module("lib/test_x.py", rules)
+    assert not is_test_module("lib/tests.py", rules)
 
 
 def test_a_helper_change_is_compared_even_when_a_test_module_is_added(tmp_path):
@@ -1360,3 +1401,152 @@ def test_a_subdirectory_of_a_src_layout_runs_from_the_root(tmp_path, capsys):
 
 def _quote_path(path):
     return subprocess.list2cmdline([path]) if os.name == "nt" else shlex.quote(path)
+
+
+# ---- review round 2 of the satellite ---------------------------------------------------------------------------
+
+def test_test_files_one_run_cannot_name_together_are_not_compared(tmp_path):
+    # packages/foo's pyproject.toml makes it pytest's rootdir for a run that names its test with tests/test_b.py, and
+    # pytest then names test_b's tests by their names alone: nothing of them could be matched.
+    repo, base, head = _repo(
+        tmp_path,
+        {"pkg/__init__.py": b"", "pkg/calc.py": SQUARE, "tests/test_b.py": STRONG,
+         "packages/foo/pyproject.toml": b"[project]\nname = 'foo'\n",
+         "packages/foo/tests/test_a.py": b"def test_a():\n    pass\n"},
+        {"tests/test_b.py": WEAK, "packages/foo/tests/test_a.py": b"def test_a():\n    assert True\n"},
+    )
+    report = _prove(repo, base, head)
+
+    assert report["status"].startswith("not compared: pytest would run the changed old test files from packages/foo")
+    assert exit_code(report, True) == 2
+
+
+def test_a_module_skipped_as_a_whole_in_a_run_of_some_files_is_no_catch(tmp_path):
+    # The mutant makes enabled() false, so the old module skips at module level and its run exits 5. The project's
+    # whole suite runs test_other.py too and passes: no catch, so no loss.
+    product = b"LEVEL = 3\n\n\ndef enabled():\n    return LEVEL >= 2\n"
+    old = (b"import pytest\n\nfrom pkg import calc\n\nif not calc.enabled():\n"
+           b"    pytest.skip('disabled', allow_module_level=True)\n\n\ndef test_level():\n    assert calc.LEVEL == 3\n")
+    new = b"from pkg import calc\n\n\ndef test_level():\n    assert calc.LEVEL == 3\n"
+    repo, base, head = _repo(
+        tmp_path,
+        {"pkg/__init__.py": b"", "pkg/calc.py": product, "tests/test_calc.py": old,
+         "tests/test_other.py": b"def test_other():\n    pass\n"},
+        {"tests/test_calc.py": new},
+    )
+    report = _prove(repo, base, head, only="pkg/calc.py:5:11:ROR:2")
+
+    (row,) = report["mutation"]["rows"]
+    assert row["old_caught_by"] is None
+    assert report["protection_losses"] == []
+
+
+STOP = b"def square(x):\n    return x * x\n\n\ndef stop(n):\n    i = 0\n    while i < n:\n        i += 1\n    return i\n"
+SERVER = (b"import pytest\n\nfrom pkg.calc import stop\n\n\n@pytest.fixture(scope='session')\ndef server():\n"
+          b"    yield\n    stop(3)\n")
+
+
+def test_a_hang_in_a_session_fixtures_teardown_is_the_whole_runs(tmp_path, short_budgets):
+    # The session fixture's teardown runs inside the last test's span, and that test (test_known_bug) already fails
+    # on the clean code. The hang is the run's, as CI's would be: the whole new suite catches the mutant.
+    repo, base, head = _repo(
+        tmp_path,
+        {"pkg/__init__.py": b"", "pkg/calc.py": STOP, "tests/conftest.py": SERVER,
+         "tests/test_calc.py": STRONG.replace(b"test_square()", b"test_square(server)"),
+         "tests/test_zzz.py": b"def test_known_bug(server):\n    assert False\n"},
+        {"tests/test_calc.py": WEAK},
+    )
+    report = _prove(repo, base, head, only="pkg/calc.py:8:8:SDL:1", timeout=1)
+
+    (row,) = report["mutation"]["rows"]
+    assert row["old_caught_by"] == ["(timeout)"]
+    assert row["suite_caught_by"] == ["(timeout)"]
+    assert report["protection_losses"] == []
+
+
+def test_a_long_list_of_test_files_goes_through_the_allow_list(tmp_path, monkeypatch):
+    # Past ARGS_LIMIT the files go to the plugin, which collects exactly them; the comparison is the same.
+    monkeypatch.setattr("checkwash_prove.engine.ARGS_LIMIT", 1)
+    repo, base, head = _weakened(tmp_path)
+    report = _prove(repo, base, head, only="pkg/calc.py:2:11:AORB:1")
+
+    assert _loss_ids(report) == ["pkg/calc.py:2:11:AORB:1"]
+
+
+def test_a_catch_is_shown_as_a_node_id_with_what_happened(tmp_path):
+    (tmp_path / "tests").mkdir()
+    (tmp_path / "tests" / "test_calc.py").write_text("")
+    assert _shown(tmp_path, None, "tests.test_calc::test_total (timeout)") == "tests/test_calc.py::test_total (timeout)"
+    assert _shown(tmp_path, None, "tests.test_calc (pytest exit 4)") == "tests/test_calc.py (pytest exit 4)"
+    assert _shown(tmp_path, None, "tests.test_calc::test_x[a (b)]") == "tests/test_calc.py::test_x[a (b)]"
+    assert _shown(tmp_path, None, "(timeout)") == "(timeout)"
+
+
+def test_a_damaged_escaping_module_still_gives_exit_2(monkeypatch, capsys):
+    monkeypatch.setitem(sys.modules, "checkwash_prove._text", None)
+    assert main(["HEAD"]) == 2
+    assert "needs a range BASE..HEAD" in capsys.readouterr().err
+
+
+def test_a_standard_error_that_cannot_be_written_is_dropped(monkeypatch):
+    class Broken(io.StringIO):
+        def write(self, text):
+            raise BrokenPipeError
+
+    monkeypatch.setattr(sys, "stderr", Broken())
+    assert main(["HEAD"]) == 2
+    assert sys.stderr is None
+
+
+def _pristine(tmp_path):
+    pristine = tmp_path / "pristine"
+    (pristine / "data").mkdir(parents=True)
+    (pristine / "data" / "a.txt").write_text("inside")
+    (pristine / "conf.txt").write_text("inside")
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (outside / "a.txt").write_text("outside")
+    return pristine, outside
+
+
+def test_a_reset_puts_a_files_mode_back(tmp_path):
+    pristine, _ = _pristine(tmp_path)
+    tree = Tree(pristine, tmp_path / "tree")
+    os.chmod(tree.path / "conf.txt", 0o444)
+    tree.reset()
+
+    assert os.access(tree.path / "conf.txt", os.W_OK)
+
+
+@pytest.mark.skipif(os.name == "nt", reason="symlinks need a privilege on Windows")
+def test_a_reset_never_writes_through_a_link_in_an_unwritable_directory(tmp_path):
+    pristine, outside = _pristine(tmp_path)
+    tree = Tree(pristine, tmp_path / "tree")
+    shutil.rmtree(tree.path / "data")
+    os.symlink(outside, tree.path / "data")
+    os.chmod(tree.path, 0o555)
+    try:
+        tree.reset()
+    finally:
+        os.chmod(tree.path, 0o755)
+
+    assert (outside / "a.txt").read_text() == "outside"
+    assert sorted(p.name for p in outside.iterdir()) == ["a.txt"]
+    assert not os.path.islink(tree.path / "data") and (tree.path / "data" / "a.txt").read_text() == "inside"
+
+
+@pytest.mark.skipif(os.name != "nt", reason="junctions are Windows'")
+def test_a_reset_never_writes_through_a_read_only_junction(tmp_path):
+    import _winapi
+    import stat as stat_
+
+    pristine, outside = _pristine(tmp_path)
+    tree = Tree(pristine, tmp_path / "tree")
+    shutil.rmtree(tree.path / "data")
+    _winapi.CreateJunction(str(outside), str(tree.path / "data"))
+    os.chmod(tree.path / "data", stat_.S_IREAD)
+    tree.reset()
+
+    assert (outside / "a.txt").read_text() == "outside"
+    assert sorted(p.name for p in outside.iterdir()) == ["a.txt"]
+    assert (tree.path / "data" / "a.txt").read_text() == "inside"

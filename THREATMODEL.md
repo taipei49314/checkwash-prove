@@ -47,9 +47,13 @@ disturb each other's results. It is not a security boundary:
 
 - every run works in a copy of a pristine tree, put back and checked after
   the run. Putting it back removes a symbolic link or junction a test left
-  without following it, and changes a file's mode only on Windows, where a
-  read-only file cannot be deleted, and only when no hard link shares the
-  file with one elsewhere;
+  without following it (on Windows, clearing the link's own read-only
+  attribute first if it has to), and changes a file's mode only on Windows,
+  where a read-only file cannot be deleted, and only when no hard link shares
+  the file with one elsewhere. On POSIX it gives the tree's own directories,
+  never a link's target, their owner's permissions back. A link it still
+  cannot remove is left alone, with nothing written through it, and the run
+  stops;
 - each run gets its own pytest cache outside the tree, `PYTEST_ADDOPTS`
   cleared, `--confcutdir` at the tree, and `-p no:randomly`;
 - every run has a time budget; at its end, or at a timeout, everything in
@@ -141,8 +145,8 @@ defence against someone with write access to your environment.
   code is not yours.
 - Not in CI on pull requests from forks, not under `pull_request_target`,
   and never in a job that holds secrets or a write token: that runs the pull
-  request's code with them. `actions/checkout` leaves its token in
-  `.git/config` unless told `persist-credentials: false`, where the tests,
-  and a partial clone's fetches, can use it.
+  request's code with them. `actions/checkout` keeps its token where Git
+  in the checkout can use it unless told `persist-credentials: false`, so
+  the tests, and a partial clone's fetches, can use it too.
 - Not as a required check. A merge gate that needs a test run is a test
   runner; this tool's result is a lead for a reviewer, not a verdict.

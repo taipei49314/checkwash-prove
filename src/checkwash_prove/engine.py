@@ -180,6 +180,14 @@ def pytest_runtest_logstart(nodeid, location):
     _mark("S", nodeid)
 
 
+@pytest.hookimpl(tryfirst=True)
+def pytest_runtest_teardown(item, nextitem):
+    # Before the last test of a file, or of the run, module- and session-scoped fixtures end too: from here a hang or
+    # a death belongs to the run, not to this test.
+    if nextitem is None or nextitem.nodeid.split("::")[0] != item.nodeid.split("::")[0]:
+        _mark("W", item.nodeid)
+
+
 def pytest_runtest_logfinish(nodeid, location):
     global _current
     _current = None
@@ -264,21 +272,51 @@ def _generator():
 
 # ---- which files are which -----------------------------------------------------------------------------------------
 
-def is_test_path(path: str, patterns: tuple[str, ...] = PYTHON_FILES) -> bool:
+def _under(path: str, testpath: str) -> bool:
+    """Whether a repository path lies under a testpaths entry (a directory, a file, or a glob of them)."""
+    entry = testpath.replace("\\", "/").strip()
+    while entry.startswith("./"):
+        entry = entry[2:]
+    entry = entry.strip("/")
+    if entry in ("", "."):
+        return True
+    return (path == entry or path.startswith(entry + "/") or fnmatch.fnmatch(path, entry)
+            or fnmatch.fnmatch(path, entry + "/*"))
+
+
+@dataclasses.dataclass(frozen=True)
+class Naming:
+    """How one revision's root configuration names its test modules: python_files, and testpaths when it sets them
+    (a run with no arguments searches only those)."""
+    python_files: tuple[str, ...] = PYTHON_FILES
+    testpaths: tuple[str, ...] = ()
+
+    def holds(self, path: str) -> bool:
+        name = path.rsplit("/", 1)[-1]
+        if not any(fnmatch.fnmatch("/" + path, "*/" + p) if "/" in p else fnmatch.fnmatch(name, p)
+                   for p in self.python_files):
+            return False
+        return not self.testpaths or any(_under(path, t) for t in self.testpaths)
+
+
+DEFAULT_NAMING = (Naming(),)
+
+
+def is_test_path(path: str, naming: tuple[Naming, ...] = DEFAULT_NAMING) -> bool:
     """A file of the test suite: any file under a test directory, a test module, or a conftest.py."""
     parts = path.split("/")
     if any(p.lower() in TEST_DIRS for p in parts[:-1]):
         return True
-    return parts[-1] == "conftest.py" or is_test_module(path, patterns)
+    return parts[-1] == "conftest.py" or is_test_module(path, naming)
 
 
-def is_test_module(path: str, patterns: tuple[str, ...] = PYTHON_FILES) -> bool:
-    """A Python file pytest collects tests from: its name matches python_files, as pytest matches it (the file name
-    for a pattern without a slash, the path otherwise)."""
+def is_test_module(path: str, naming: tuple[Naming, ...] = DEFAULT_NAMING) -> bool:
+    """A Python file pytest collects tests from at either revision: its name matches python_files as pytest matches
+    it (the file name for a pattern without a slash, the path otherwise), under testpaths when they are set."""
     name = path.rsplit("/", 1)[-1]
     if not name.endswith(".py") or name == "conftest.py":
         return False
-    return any(fnmatch.fnmatch("/" + path, "*/" + p) if "/" in p else fnmatch.fnmatch(name, p) for p in patterns)
+    return any(rule.holds(path) for rule in naming)
 
 
 def is_config_name(path: str) -> bool:
@@ -350,27 +388,34 @@ def addopts(config: pathlib.Path | None) -> str:
     return " ".join(map(str, value)) if isinstance(value, list) else str(value)
 
 
-def python_file_patterns(repo: str, revs: tuple[str, ...]) -> tuple[str, ...]:
-    """The python_files patterns of the repository root's pytest configuration at these revisions, together, each
-    revision's being pytest's default when its configuration sets none. pytest collects test modules by these names,
-    so a project that sets them (pytest-django's `tests.py`) has its test modules found by them too."""
-    found: list[str] = []
+def _words(value) -> tuple[str, ...]:
+    if not value:
+        return ()
+    return tuple(str(v) for v in value) if isinstance(value, list) else tuple(str(value).split())
+
+
+def naming_rules(repo: str, revs: tuple[str, ...]) -> tuple[Naming, ...]:
+    """How the repository root's pytest configuration names test modules at each of these revisions: its
+    python_files (pytest's default when it sets none) and its testpaths. pytest collects test modules by these, so a
+    project that sets them (pytest-django's `tests.py`) has its test modules found by them too, and a broad pattern
+    reaches only the testpaths."""
+    rules: list[Naming] = []
     for rev in revs:
-        value = None
+        files = paths = None
         for name in CONFIG_NAMES:
             data = blob(repo, rev, name)
             if pytest_settings(name, data) is None:
                 continue
+            text = data.decode("utf-8", "replace")
             try:
-                value = _setting(name, data.decode("utf-8", "replace"), "python_files")
+                files, paths = _setting(name, text, "python_files"), _setting(name, text, "testpaths")
             except tomllib.TOMLDecodeError:
-                value = None
+                pass
             break
-        if value:
-            found += [str(v) for v in value] if isinstance(value, list) else str(value).split()
-        else:
-            found += PYTHON_FILES
-    return tuple(dict.fromkeys(found))
+        rule = Naming(_words(files) or PYTHON_FILES, _words(paths))
+        if rule not in rules:
+            rules.append(rule)
+    return tuple(rules) or DEFAULT_NAMING
 
 
 def _walk_for_config(start: pathlib.Path, tree: pathlib.Path) -> tuple[pathlib.Path | None, pathlib.Path | None]:
@@ -523,8 +568,13 @@ def _is_link(path) -> bool:
     return bool(getattr(st, "st_file_attributes", 0) & getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0))
 
 
-def _scan(root: pathlib.Path) -> tuple[dict[str, tuple[int, int]], set[str]]:
-    files: dict[str, tuple[int, int]] = {}
+def _signature(st: os.stat_result) -> tuple[int, int, int]:
+    # The mode too: a test that makes a file read-only leaves its size and time alone.
+    return st.st_size, st.st_mtime_ns, stat.S_IMODE(st.st_mode)
+
+
+def _scan(root: pathlib.Path) -> tuple[dict[str, tuple[int, int, int]], set[str]]:
+    files: dict[str, tuple[int, int, int]] = {}
     dirs: set[str] = set()
     for current, dirnames, filenames in os.walk(root):
         rel_dir = os.path.relpath(current, root)
@@ -532,16 +582,28 @@ def _scan(root: pathlib.Path) -> tuple[dict[str, tuple[int, int]], set[str]]:
         for name in dirnames:
             rel = os.path.normpath(os.path.join(rel_dir, name))
             if _is_link(os.path.join(current, name)):
-                st = os.lstat(os.path.join(current, name))
-                files[rel] = (st.st_size, st.st_mtime_ns)
+                files[rel] = _signature(os.lstat(os.path.join(current, name)))
             else:
                 dirs.add(rel)
                 keep.append(name)
         dirnames[:] = keep
         for name in filenames:
-            st = os.lstat(os.path.join(current, name))
-            files[os.path.normpath(os.path.join(rel_dir, name))] = (st.st_size, st.st_mtime_ns)
+            files[os.path.normpath(os.path.join(rel_dir, name))] = _signature(os.lstat(os.path.join(current, name)))
     return files, dirs
+
+
+def _link_writable(path: pathlib.Path) -> None:
+    """Windows: a link's own read-only attribute keeps it from being removed. Clear it on the link, never on what it
+    points at: Python before 3.13 sets a link's own attributes there, and later versions are asked not to follow."""
+    if os.name != "nt":
+        return
+    try:
+        if os.chmod in os.supports_follow_symlinks:
+            os.chmod(path, stat.S_IWRITE | stat.S_IREAD, follow_symlinks=False)
+        elif sys.version_info < (3, 13):
+            os.chmod(path, stat.S_IWRITE | stat.S_IREAD)
+    except (OSError, NotImplementedError):
+        pass
 
 
 def _remove(path: pathlib.Path) -> None:
@@ -549,13 +611,18 @@ def _remove(path: pathlib.Path) -> None:
     target's, which may be outside the tree. A file's mode is changed only on Windows, where a read-only file cannot be
     deleted, and only when no hard link shares it with a file elsewhere."""
     if _is_link(path):
-        try:
-            os.unlink(path)
-        except OSError:
+        for attempt in range(2):
             try:
-                os.rmdir(path)          # a directory link on Windows
+                os.unlink(path)
+                return
             except OSError:
-                pass
+                try:
+                    os.rmdir(path)          # a directory link on Windows
+                    return
+                except OSError:
+                    pass
+            if attempt == 0:
+                _link_writable(path)
         return
     if path.is_dir():
         shutil.rmtree(path, ignore_errors=True)
@@ -583,6 +650,16 @@ class Tree:
 
     def _put_back(self) -> None:
         files, dirs = _scan(self.path)
+        if os.name != "nt":
+            # A directory a test left unwritable keeps what is in it; the tree's own directories, never a link's
+            # target, get their owner's permissions back.
+            for rel in [".", *dirs]:
+                try:
+                    st = os.lstat(self.path / rel)
+                    if stat.S_ISDIR(st.st_mode) and st.st_mode & stat.S_IRWXU != stat.S_IRWXU:
+                        os.chmod(self.path / rel, stat.S_IMODE(st.st_mode) | stat.S_IRWXU)
+                except OSError:
+                    pass
         for rel, sig in files.items():
             if self.files.get(rel) != sig:
                 _remove(self.path / rel)
@@ -590,11 +667,26 @@ class Tree:
             shutil.rmtree(self.path / rel, ignore_errors=True)
         for rel, sig in self.files.items():
             if files.get(rel) != sig:
+                if self._through_link(rel):
+                    # A link that could not be removed stands where a directory should be: writing would go through
+                    # it, outside the tree. The tree stays different, and reset() stops the run.
+                    continue
                 target = self.path / rel
                 target.parent.mkdir(parents=True, exist_ok=True)
                 if target.exists() or _is_link(target):
                     _remove(target)
+                if _is_link(target):
+                    continue
                 shutil.copy2(self.pristine / rel, target, follow_symlinks=False)
+
+    def _through_link(self, rel: str) -> bool:
+        """Whether a directory on the way to rel is a link (or junction) rather than the tree's own directory."""
+        current = self.path
+        for part in pathlib.PurePath(rel).parts[:-1]:
+            current = current / part
+            if _is_link(current):
+                return True
+        return False
 
     def reset(self, mutant: Candidate | None = None) -> None:
         # Checked, not assumed: a process a test left behind can hold a file or write one back.
@@ -639,7 +731,7 @@ def _tree_key(key: tuple[str, str], prefix: str) -> tuple[str, str]:
 
 def _running(progress: pathlib.Path) -> list[tuple[str, str]]:
     """What a run had started and not finished, from the plugin's progress lines, innermost last: ("C", a test file
-    being collected) or ("S", a test)."""
+    being collected), ("S", a test), or ("W", a test whose teardown ends module- or session-scoped fixtures too)."""
     try:
         lines = progress.read_text(encoding="utf-8", errors="replace").splitlines()
     except OSError:
@@ -649,10 +741,12 @@ def _running(progress: pathlib.Path) -> list[tuple[str, str]]:
         kind, _, nodeid = line.partition(" ")
         if kind in ("C", "S"):
             started.append((kind, nodeid))
+        elif kind == "W":
+            started = [("W", n) if (k, n) == ("S", nodeid) else (k, n) for k, n in started]
         elif kind in ("c", "F"):
-            entry = ("C" if kind == "c" else "S", nodeid)
+            kinds = ("C",) if kind == "c" else ("S", "W")
             for i in range(len(started) - 1, -1, -1):
-                if started[i] == entry:
+                if started[i][1] == nodeid and started[i][0] in kinds:
                     del started[i]
                     break
     return started
@@ -811,13 +905,13 @@ def _failure_line(message: str, text: str) -> str:
     return (errors[-1] if errors else lines[-1] if lines else (first[0] if first else ""))[:300]
 
 
-# pytest-xdist's options, `-nauto` and `-n4` spelt together included.
-_XDIST_OPTION = re.compile(r"(?<![\w-])(-n|--numprocesses|--dist|--tx)(?![\w-])"
-                           r"|(?<![\w-])-n(?:\d|auto(?![\w-])|logical(?![\w-]))")
+# pytest-xdist's options, also spelt together (`-nauto`, `-n4`) and after other short flags (`-vn2`, `-qn auto`). A
+# false match only adds `-n 0`, which xdist accepts.
+_XDIST_OPTION = re.compile(r"(?<![\w-])(--numprocesses|--dist|--tx)(?![\w-])"
+                           r"|(?<![\w-])-[A-Za-z]*n(?:\d|auto(?![\w-])|logical(?![\w-])|(?![\w-]))")
 _COV_OPTION = re.compile(r"(?<![\w-])--cov(?![\w-])")
-# Stepwise ends a run at its first failure (--sw-skip at its second, and turns stepwise on), and no option turns it
-# off again.
-_STEPWISE_OPTION = re.compile(r"(?<![\w-])(--sw|--stepwise|--sw-skip|--stepwise-skip)(?![\w-])")
+# Stepwise ends a run at its first failure; --sw-skip and --sw-reset turn it on too, and no option turns it off.
+_STEPWISE_OPTION = re.compile(r"(?<![\w-])(--sw|--stepwise)(-skip|-reset)?(?![\w-])")
 
 
 class Runner:
@@ -958,7 +1052,7 @@ def _label(key: tuple[str, str]) -> str:
 
 
 def _killed(clean: RunResult, run: RunResult, collected: Collected | None = None, *,
-            ambiguous_counts: bool = False) -> list[str] | None:
+            ambiguous_counts: bool = False, subset: bool = False) -> list[str] | None:
     """What shows that a run caught the mutant, as CI would see it; None when it did not.
 
     A test that fails or errors now is a catch when it counts: it did not fail on the clean code (it passed, or was
@@ -969,7 +1063,9 @@ def _killed(clean: RunResult, run: RunResult, collected: Collected | None = None
     A timeout is a catch, given a budget well over the clean run's time; so is a run that wrote no results where the
     clean run had passes, or, with no failing test to explain it, a nonzero exit the clean run did not have. The
     plugin's progress lines name the test, or the test file being collected, that the run was in when it hung or
-    died, and that one must count for the run to be a catch. A run that was in none failed as a whole, as CI's would.
+    died, and that one must count for the run to be a catch. A run that was in none, or in a teardown that ends
+    module- or session-scoped fixtures, failed as a whole, as CI's would. In a run of some of the suite's files
+    (`subset`), exit 5, no test ran, is no catch: the whole suite runs others and passes.
 
     A test the clean run has no result for (a mutant changed its parameter id) counts when the clean run passed its
     other instances. With none to go by it is ambiguous: no catch for the old tests, since a loss needs the old tests
@@ -1007,6 +1103,8 @@ def _killed(clean: RunResult, run: RunResult, collected: Collected | None = None
         return [_label(k) for k in caught]
     if run.code == "timeout":
         whole = "timeout"
+    elif subset and run.code == 5:
+        whole = None
     elif not run.outcomes:
         whole = (f"pytest exit {run.code}, no results" if any(v == "passed" for v in clean.outcomes.values())
                  else None)
@@ -1015,7 +1113,7 @@ def _killed(clean: RunResult, run: RunResult, collected: Collected | None = None
     else:
         whole = None
     if whole is not None:
-        if not run.running:
+        if not run.running or run.running[-1][0] == "W":
             return [f"({whole})"]
         kind, nodeid = run.running[-1]
         key = junit_key(nodeid) if kind == "S" else ("", re.sub(r"\.py$", "", nodeid.split("::")[0].replace("/", ".")))
@@ -1109,6 +1207,21 @@ def _split(test: str) -> tuple[str, str]:
     return (classname, name) if sep else ("", test)
 
 
+# What _killed adds after a test it pins a hang or a death on, or an ambiguous catch.
+_WHY = re.compile(r"^(?P<test>.+?) \((?P<why>timeout|pytest exit [^()]*|no clean result to compare|[^()]*; no clean "
+                  r"result to compare)\)$")
+
+
+def _shown(tree: pathlib.Path, rootdir: pathlib.Path | None, caught: str) -> str:
+    """A catch as the report shows it: a node id from the tree's root, with what _killed said about it."""
+    if caught.startswith("("):
+        return caught
+    found = _WHY.match(caught)
+    if found is None:
+        return node_id(tree, rootdir, *_split(caught))
+    return f"{node_id(tree, rootdir, *_split(found['test']))} ({found['why']})"
+
+
 # ---- mutants -------------------------------------------------------------------------------------------------------
 
 @dataclasses.dataclass
@@ -1172,7 +1285,7 @@ def file_mutants(data: bytes, lines: set[int]) -> list[dict]:
 
 
 def _candidates(tree, import_root, old_exec, new_exec, changed, report,
-                patterns: tuple[str, ...] = PYTHON_FILES) -> list[Candidate]:
+                naming: tuple[Naming, ...] = DEFAULT_NAMING) -> list[Candidate]:
     """Catalogue mutants on the product lines the old tests executed, most telling first: lines only the old tests
     executed, then lines the range added or replaced, then the rest of the files it changed, then everything else, and
     last the lines that only old tests which do not pass on the new code ran; within each rank, one mutant from each
@@ -1182,7 +1295,7 @@ def _candidates(tree, import_root, old_exec, new_exec, changed, report,
     prefix = "" if import_root == "." else import_root + "/"
     out: list[Candidate] = []
     for rel in sorted(old_all):
-        if not rel.startswith(prefix) or not rel.endswith(".py") or is_test_path(rel, patterns) or is_config_name(rel):
+        if not rel.startswith(prefix) or not rel.endswith(".py") or is_test_path(rel, naming) or is_config_name(rel):
             continue
         try:
             muts = file_mutants((tree / rel).read_bytes(), old_all[rel])
@@ -1274,10 +1387,10 @@ def prove(repo: str, spec: str, opts: Options) -> dict:
     submodules = sorted(c.path for c in changes if c.gitlink)
     if submodules:
         report["notes"].append("submodules are not compared: " + ", ".join(submodules))
-    patterns = python_file_patterns(repo, (base, head))
-    suite = _suite_changes(repo, base, head, [c for c in changes if not c.gitlink], patterns)
-    modules = [c for c in suite if is_test_module(c.path, patterns)]
-    others = [c for c in suite if not is_test_module(c.path, patterns)]
+    naming = naming_rules(repo, (base, head))
+    suite = _suite_changes(repo, base, head, [c for c in changes if not c.gitlink], naming)
+    modules = [c for c in suite if is_test_module(c.path, naming)]
+    others = [c for c in suite if not is_test_module(c.path, naming)]
     old_tests = sorted(c.path for c in modules if c.status != "A")
     new_tests = sorted(c.path for c in modules if c.status != "D")
     # Unchanged test modules that a changed helper, data or configuration file can affect; each side keeps only those
@@ -1285,19 +1398,20 @@ def prove(repo: str, spec: str, opts: Options) -> dict:
     through: tuple[set[str], set[str]] = (set(), set())
     if others:
         dirs = sorted({scope_dir(c.path) for c in others})
-        through = ({p for p in tree_files(repo, base, dirs) if is_test_module(p, patterns)} - set(old_tests),
-                   {p for p in tree_files(repo, head, dirs) if is_test_module(p, patterns)} - set(new_tests))
+        through = ({p for p in tree_files(repo, base, dirs) if is_test_module(p, naming)} - set(old_tests),
+                   {p for p in tree_files(repo, head, dirs) if is_test_module(p, naming)} - set(new_tests))
         old_tests, new_tests = sorted(set(old_tests) | through[0]), sorted(set(new_tests) | through[1])
         report["notes"].append("changed test helpers, data or configuration (" + ", ".join(c.path for c in others)
                                + ") are compared through the test modules under "
                                + ", ".join(d or "the repository root" for d in dirs)
                                + (", as well as the changed test modules" if modules else ""))
     product = sorted(c.path for c in changes if not c.gitlink and c.status != "D" and c.path.endswith(".py")
-                     and not is_test_path(c.path, patterns))
+                     and not is_test_path(c.path, naming))
     report.update({"tests": {"old": old_tests, "new": new_tests}, "test_suite_files_changed": [c.path for c in suite],
                    "product_files_changed": product})
-    if patterns != PYTHON_FILES:
-        report["python_files"] = list(patterns)
+    if naming != DEFAULT_NAMING:
+        report["test_file_naming"] = [{"python_files": list(r.python_files), "testpaths": list(r.testpaths)}
+                                      for r in naming]
     if not suite:
         report.update(status="nothing to compare: the range changes no test file", nothing_to_compare=True)
         return report
@@ -1312,7 +1426,7 @@ def prove(repo: str, spec: str, opts: Options) -> dict:
     try:
         runner = Runner(opts, _import_root(opts, repo, head), work)
         return _prove_in(work, runner, repo, base, head, opts, suite, old_tests, new_tests, product, report,
-                         through, patterns)
+                         through, naming)
     except KeyboardInterrupt:
         if runner is not None:
             runner.stop()
@@ -1321,15 +1435,19 @@ def prove(repo: str, spec: str, opts: Options) -> dict:
         if not opts.keep:
             shutil.rmtree(work, ignore_errors=True)
             if work.exists() and sys.stderr is not None:
-                sys.stderr.write(f"checkwash-prove: could not remove {work}\n")
+                try:
+                    # In a finally block: a failed write here must not replace the report being returned.
+                    sys.stderr.write(f"checkwash-prove: could not remove {work}\n")
+                except (OSError, ValueError):
+                    pass
 
 
 def _suite_changes(repo: str, base: str, head: str, changes: list[Change],
-                   patterns: tuple[str, ...] = PYTHON_FILES) -> list[Change]:
+                   naming: tuple[Naming, ...] = DEFAULT_NAMING) -> list[Change]:
     """The changed files of the test suite: test files, and configuration files whose pytest settings changed."""
     out = []
     for c in changes:
-        if is_test_path(c.path, patterns):
+        if is_test_path(c.path, naming):
             out.append(c)
         elif is_config_name(c.path):
             name = c.path.rsplit("/", 1)[-1]
@@ -1353,7 +1471,7 @@ def _import_root(opts: Options, repo: str, head: str) -> str:
 
 
 def _prove_in(work, runner, repo, base, head, opts, suite, old_tests, new_tests, product, report,
-              through=(set(), set()), patterns=PYTHON_FILES):
+              through=(set(), set()), naming=DEFAULT_NAMING):
     started = time.monotonic()
     pristine_new, pristine_old = work / "pristine" / "new", work / "pristine" / "old"
     checkout(repo, head, pristine_new)
@@ -1385,17 +1503,45 @@ def _prove_in(work, runner, repo, base, head, opts, suite, old_tests, new_tests,
         if collected is None:
             report["notes"].append(f"the {side} tree's own test collection could not be read, so test modules it "
                                    "may exclude count as protection")
-    if through[0] or through[1]:
-        # Modules compared only through a changed helper, data or configuration file: those each side's own run
-        # collects.
-        if collected_old is not None:
-            old_tests = [t for t in old_tests if t not in through[0] or t in collected_old.files]
-        if collected_new is not None:
-            new_tests = [t for t in new_tests if t not in through[1] or t in collected_new.files]
-        report["tests"] = {"old": old_tests, "new": new_tests}
-        if not old_tests:
+    # Only the modules each side's own whole-suite run collects are run. One the project excludes (collect_ignore,
+    # --ignore, outside testpaths) protected nothing in CI, and named on the command line it would bring in its
+    # directory's conftest.py and its fixtures, whose failures CI never sees.
+    left_out: tuple[list[str], list[str]] = ([], [])
+    if collected_old is not None:
+        left_out[0].extend(t for t in old_tests if t not in collected_old.files and t not in through[0])
+        old_tests = [t for t in old_tests if t in collected_old.files]
+    if collected_new is not None:
+        left_out[1].extend(t for t in new_tests if t not in collected_new.files and t not in through[1])
+        new_tests = [t for t in new_tests if t in collected_new.files]
+    report["tests"] = {"old": old_tests, "new": new_tests}
+    for side, names in (("old", left_out[0]), ("new", left_out[1])):
+        if names:
+            report["notes"].append(f"changed {side} test modules that the {side} suite (a pytest run at the repository "
+                                   "root) does not collect are not run, since they protect nothing in CI: "
+                                   + ", ".join(names[:5]))
+    if not old_tests:
+        root_config = locate_config(clean_old.path, [])
+        if any(locate_config(clean_old.path, [t]) != root_config for t in left_out[0]):
+            report["status"] = ("not compared: pytest runs the changed old tests under a configuration file of their "
+                                "own, and a pytest run at the repository root, which prove takes as the suite, does "
+                                "not collect them")
+        elif left_out[0]:
+            report.update(status="nothing to compare: the old suite (a pytest run at the repository root) does not "
+                                 "collect the changed old tests, so they protected nothing", nothing_to_compare=True)
+        else:
             report.update(status="nothing to compare: no test module that existed before the change is affected",
                           nothing_to_compare=True)
+        return report
+    # One pytest run names every test file of a side; pytest names a file outside the rootdir it picks for them by its
+    # test name alone, and no result of it could be matched.
+    for side, tree, tests in (("old", clean_old, old_tests), ("new", clean_new, new_tests)):
+        config = locate_config(tree.path, tests) if tests else None
+        rel = os.path.relpath(config.parent, tree.path).replace(os.sep, "/") if config else "."
+        outside = [t for t in tests if rel != "." and not t.startswith(rel + "/")]
+        if outside:
+            report["status"] = (f"not compared: pytest would run the changed {side} test files from {rel}, where its "
+                                f"configuration is, and {', '.join(outside[:3])} lies outside it, so one run cannot "
+                                "name them all; compare the parts apart")
             return report
 
     # Clean runs to compare against, untraced as the mutant runs are; tracing slows tests that measure time.
@@ -1471,7 +1617,7 @@ def _prove_in(work, runner, repo, base, head, opts, suite, old_tests, new_tests,
     old_exec = _executed(old_trace, clean_old.path, old_clean)
     new_exec = _executed(new_trace, clean_new.path, new_clean)
     changed = changed_lines(repo, base, head, product)
-    candidates = _candidates(pristine_new, import_root, old_exec, new_exec, changed, report, patterns)
+    candidates = _candidates(pristine_new, import_root, old_exec, new_exec, changed, report, naming)
     if not candidates:
         # Zero mutants is not zero losses: nothing was tested.
         report["mutation"] = {"generated": 0, "run": 0, "skipped_over_cap": 0}
@@ -1558,8 +1704,7 @@ def _prove_in(work, runner, repo, base, head, opts, suite, old_tests, new_tests,
     for row in rows:
         if row["category"] in ("loss", "unconfirmed loss"):
             entry = {**{k: row[k] for k in ("id", "op", "path", "line", "before", "after", "what")},
-                     "old_caught_by": [node_id(clean_old.path, old_clean.rootdir, *_split(t))
-                                       for t in row["old_caught_by"]],
+                     "old_caught_by": [_shown(clean_old.path, old_clean.rootdir, t) for t in row["old_caught_by"]],
                      "replay": f"{replay} --only {_quote([row['id']])}"}
             if row["category"] == "loss":
                 report["protection_losses"].append(entry)
@@ -1578,12 +1723,13 @@ def _prove_in(work, runner, repo, base, head, opts, suite, old_tests, new_tests,
 def _compare(runner, c, o, n, old_tests, new_tests, old_clean, new_clean, baseline, budgets,
              collected=(None, None)) -> dict:
     o.reset(c)
-    old_k = _killed(old_clean, runner.pytest(o.path, old_tests, budgets["old"], old_side=True), collected[0])
+    old_k = _killed(old_clean, runner.pytest(o.path, old_tests, budgets["old"], old_side=True), collected[0],
+                    subset=True)
     new_k = None
     if new_tests:
         n.reset(c)
         new_k = _killed(new_clean, runner.pytest(n.path, new_tests, budgets["new"], old_side=False), collected[1],
-                        ambiguous_counts=True)
+                        ambiguous_counts=True, subset=True)
     row = {"id": c.mid, "op": c.op, "path": c.path, "line": c.line, "what": c.what, "before": c.before,
            "after": c.after, "rank": c.priority, "old_caught_by": old_k, "new_caught_by": new_k}
     row["category"] = {(True, True): "both", (True, False): "old only", (False, True): "new only",
@@ -1624,7 +1770,7 @@ def _confirm(runner, rows, candidates, clean_old, clean_new, old_tests, new_test
         else:
             clean_old.reset(c)
             run = runner.pytest(clean_old.path, old_tests, budgets["old"], old_side=True)
-            if _killed(old_ref, run, collected[0]) is None:
+            if _killed(old_ref, run, collected[0], subset=True) is None:
                 why = "the old tests did not catch it again"
         if why is None and new_ref is not None:
             if not new_ref.usable:
@@ -1632,7 +1778,7 @@ def _confirm(runner, rows, candidates, clean_old, clean_new, old_tests, new_test
             else:
                 clean_new.reset(c)
                 run = runner.pytest(clean_new.path, new_tests, budgets["new"], old_side=False)
-                if _killed(new_ref, run, collected[1], ambiguous_counts=True):
+                if _killed(new_ref, run, collected[1], ambiguous_counts=True, subset=True):
                     why = "the new tests caught it when run alone"
         if why is None:
             if not suite_ref.usable:

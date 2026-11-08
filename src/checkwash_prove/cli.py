@@ -15,7 +15,6 @@ import subprocess
 import sys
 
 from checkwash_prove import __version__
-from checkwash_prove._text import visible
 
 DEFAULT_TIMEOUT = 30.0
 DEFAULT_SUITE_TIMEOUT = 900.0
@@ -63,12 +62,20 @@ def _advise(text: str) -> None:
     as in the text report, with a message's later lines marked as its continuation."""
     if sys.stderr is None:
         return
+    try:
+        from checkwash_prove._text import visible
+    except Exception:  # noqa: BLE001 - a damaged install still reports, with everything but printable ASCII escaped
+        def visible(line: str) -> str:
+            return "".join(c if " " <= c <= "~" else f"\\u{ord(c):04x}" for c in line)
     first, *rest = text.splitlines() or [""]
     try:
         write_text("".join(line + "\n" for line in [visible(first), *("  | " + visible(r) for r in rest)]),
                    sys.stderr)
+        sys.stderr.flush()
     except (OSError, ValueError):
-        pass
+        # A stderr that cannot be written (a closed pipe) is dropped, so Python's flush at exit cannot fail on it
+        # and turn the exit code into 120.
+        sys.stderr = None
 
 
 def _git_read(repo: str, args: list[str]) -> bytes:
