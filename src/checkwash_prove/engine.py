@@ -164,14 +164,20 @@ def pytest_collectstart(collector):
         _mark("C", collector.nodeid)
 
 
+_errors = []
+
+
 def pytest_collectreport(report):
     _mark("c", report.nodeid)
+    # A test file that fails to import is still part of the suite: its run fails on it.
+    if report.failed:
+        _errors.append(report.nodeid)
 
 
 def pytest_collection_finish(session):
     if _COLLECT:
         with open(_COLLECT, "w", encoding="utf-8") as fh:
-            json.dump([item.nodeid for item in session.items], fh)
+            json.dump({"items": [item.nodeid for item in session.items], "errors": _errors}, fh)
 
 
 def pytest_runtest_logstart(nodeid, location):
@@ -1176,12 +1182,17 @@ def _collect(runner: Runner, tree: Tree, opts: Options, *, old_side: bool) -> Co
     result = runner.pytest(tree.path, [], opts.suite_timeout, old_side=old_side, collect_out=out)
     if not out.exists():
         return None
-    nodeids = json.loads(out.read_text(encoding="utf-8"))
+    found = json.loads(out.read_text(encoding="utf-8"))
+    nodeids = found["items"]
+    # Files that failed to collect are the suite's too: its run fails on them, as an old module that no longer
+    # imports on the new code does.
+    errors = [n for n in found["errors"] if n and n.split("::")[0].endswith(".py")]
     prefix = os.path.relpath(result.rootdir or tree.path, tree.path).replace(os.sep, "/")
     prefix = "" if prefix == "." else prefix + "/"
     keys = {_tree_key(junit_key(n), result.prefix) for n in nodeids}
-    return Collected({prefix + n.split("::")[0] for n in nodeids}, keys, {(c, n.partition("[")[0]) for c, n in keys},
-                     {result.prefix + re.sub(r"\.py$", "", n.split("::")[0].replace("/", ".")) for n in nodeids})
+    return Collected({prefix + n.split("::")[0] for n in nodeids + errors}, keys,
+                     {(c, n.partition("[")[0]) for c, n in keys},
+                     {result.prefix + re.sub(r"\.py$", "", n.split("::")[0].replace("/", ".")) for n in nodeids + errors})
 
 
 def node_id(tree: pathlib.Path, rootdir: pathlib.Path | None, classname: str, name: str) -> str:
