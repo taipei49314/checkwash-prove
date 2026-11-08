@@ -134,6 +134,111 @@ def test_the_vendored_catalogue_is_the_frozen_generator():
     assert verify_catalogue() == CATALOGUE_SHA256 == FROZEN_GENERATOR
 
 
+@pytest.mark.parametrize(
+    ("path", "suite", "module"),
+    [
+        ("tests/test_calc.py", True, True),
+        ("tests/conftest.py", True, False),
+        ("conftest.py", True, False),
+        ("pkg/calc_test.py", True, True),
+        ("tests/helpers.py", True, False),
+        ("Tests/helpers.py", True, False),
+        # Data the old tests read goes back to BASE with them.
+        ("tests/data/expected.json", True, False),
+        ("src/pkg/testing.py", False, False),
+        ("src/pkg/calc.py", False, False),
+        ("docs/test_plan.md", False, False),
+    ],
+)
+def test_which_files_belong_to_the_test_suite(path, suite, module):
+    assert is_test_path(path) is suite
+    assert is_test_module(path) is module
+
+
+@pytest.mark.parametrize(("given", "root"), [("src", "src"), ("./src/", "src"), ("src\\", "src"),
+                                             ("python\\src", "python/src"), (".", "."), ("./", ".")])
+def test_an_import_root_is_named_the_same_however_it_is_typed(given, root):
+    assert normalise_root(given) == root
+
+
+def test_a_relative_interpreter_becomes_absolute(tmp_path, monkeypatch):
+    # The tests run with the temporary tree as their working directory.
+    monkeypatch.chdir(tmp_path)
+    assert interpreter(os.path.join("venv", "bin", "python")) == str(tmp_path / "venv" / "bin" / "python")
+    assert interpreter(None) == sys.executable
+
+
+def test_changed_lines_are_the_head_lines_the_range_added_or_replaced(tmp_path):
+    repo, base, head = _repo(
+        tmp_path,
+        {"pkg/a.py": b"a = 1\nb = 2\nc = 3\n", "pkg/gone.py": b"x = 1\ny = 2\n", "my pkg/b.py": b"v = 1\n"},
+        {"pkg/a.py": b"a = 1\nb = 20\nc = 3\nd = 4\n", "pkg/gone.py": b"x = 1\n", "my pkg/b.py": b"v = 2\n"},
+    )
+    # A file that only lost lines is still a changed file, with no changed line;
+    # a path with a space is read from the change list, not parsed out of a patch.
+    assert changed_lines(str(repo), base, head, ["pkg/a.py", "pkg/gone.py", "my pkg/b.py"]) == {
+        "pkg/a.py": {2, 4}, "pkg/gone.py": set(), "my pkg/b.py": {1}}
+
+
+PASSED = {("tests.test_calc", "test_square"): "passed"}
+
+
+@pytest.mark.parametrize(
+    ("clean", "run", "caught"),
+    [
+        (RunResult(0, PASSED, {}), RunResult(1, {("tests.test_calc", "test_square"): "failed"}, {}),
+         ["tests.test_calc::test_square"]),
+        (RunResult(0, PASSED, {}), RunResult("timeout", {}, {}), ["(timeout)"]),
+        # CI passes a skipped test, so a mutant that makes a test skip got through.
+        (RunResult(0, PASSED, {}), RunResult(0, {("tests.test_calc", "test_square"): "skipped"}, {}), None),
+        (RunResult(0, PASSED, {}), RunResult(0, PASSED, {}), None),
+        # A collection error fails CI though no test that passed has failed.
+        (RunResult(0, PASSED, {}), RunResult(2, PASSED, {}), ["(pytest exit 2)"]),
+        # A run that died without results, while the clean one had passes.
+        (RunResult(0, PASSED, {}), RunResult(5, {}, {}), ["(pytest exit 5, no results)"]),
+        (RunResult(1, PASSED, {}), RunResult(1, {}, {}), ["(pytest exit 1, no results)"]),
+        # The clean run already exited 1 (an old test that needs clarification): the same exit is no catch.
+        (RunResult(1, PASSED, {}), RunResult(1, PASSED, {}), None),
+        # Nor is an interruption the clean run had too.
+        (RunResult(2, PASSED, {}), RunResult(2, PASSED, {}), None),
+        # A module that did not collect on the clean code either is no catch; one that stops collecting is.
+        (RunResult(1, {**PASSED, ("", "tests.test_old"): "failed"}, {}),
+         RunResult(1, {("", "tests.test_old"): "failed", ("", "tests.test_calc"): "failed"}, {}),
+         ["tests.test_calc"]),
+        (RunResult(1, {**PASSED, ("", "tests.test_old"): "failed"}, {}),
+         RunResult(1, {**PASSED, ("", "tests.test_old"): "failed"}, {}), None),
+        # A mutant that lets a module import that did not on the clean code
+        # trades one failure for another: that part of the suite was red already.
+        (RunResult(1, {**PASSED, ("", "tests.test_old"): "failed"}, {}),
+         RunResult(1, {**PASSED, ("tests.test_old", "test_x"): "failed",
+                       ("tests.test_old.TestY", "test_z"): "failed"}, {}), None),
+        # A test that was skipped on the clean code and fails now fails CI.
+        (RunResult(0, {**PASSED, ("tests.test_calc", "test_later"): "skipped"}, {}),
+         RunResult(1, {**PASSED, ("tests.test_calc", "test_later"): "failed"}, {}),
+         ["tests.test_calc::test_later"]),
+    ],
+)
+def test_what_counts_as_caught_is_what_ci_would_fail(clean, run, caught):
+    assert _killed(clean, run) == caught
+
+
+@pytest.mark.parametrize(("report", "flag", "code"), [
+    ({"protection_losses": [1], "status": "done", "compared": True}, False, 0),
+    ({"protection_losses": [1], "status": "done", "compared": True}, True, 1),
+    ({"protection_losses": [], "status": "done", "compared": True, "mutation": {"categories": {"both": 3}}}, True, 0),
+    ({"protection_losses": [], "status": "done", "compared": True,
+      "mutation": {"categories": {"both": 2, "undecided": 1}}}, True, 2),
+    ({"protection_losses": [], "status": "nothing to compare: x", "nothing_to_compare": True}, True, 0),
+    ({"protection_losses": [], "status": "no mutants: x"}, True, 2),
+    ({"protection_losses": [], "status": "listed: no mutant was run"}, True, 0),
+    # A loss that did not repeat alone was not decided either way.
+    ({"protection_losses": [], "status": "done", "compared": True,
+      "mutation": {"categories": {"both": 2, "unconfirmed loss": 1}}}, True, 2),
+])
+def test_fail_on_loss_never_passes_a_run_that_compared_nothing(report, flag, code):
+    assert exit_code(report, flag) == code
+
+
 # ---- the satellite -------------------------------------------------------------------------------------------------
 
 def test_the_satellite_never_imports_checkwash():
