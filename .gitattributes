@@ -1,0 +1,5 @@
+# The catalogue is checked by hash (over LF-normalised bytes), so keep every text file LF on every OS.
+* text=auto eol=lf
+*.py text eol=lf
+*.md text eol=lf
+*.toml text eol=lf

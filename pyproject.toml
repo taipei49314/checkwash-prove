@@ -1,0 +1,37 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "checkwash-prove"
+version = "0.1.0.dev0"
+description = "Experimental companion to checkwash: runs a change's old and new tests against catalogue mutants to show protection the change dropped."
+readme = "README.md"
+license = "Apache-2.0"
+requires-python = ">=3.11"
+authors = [{ name = "taipei49314" }]
+keywords = ["mutation-testing", "pytest", "test-tampering", "ai-agent", "code-review"]
+classifiers = [
+    "Development Status :: 2 - Pre-Alpha",
+    "Environment :: Console",
+    "Intended Audience :: Developers",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Software Development :: Testing",
+]
+# Nothing at run time: the tests run in the interpreter given with --python, which needs pytest 7 or later.
+dependencies = []
+
+[project.optional-dependencies]
+dev = ["pytest>=8"]
+
+[project.scripts]
+checkwash-prove = "checkwash_prove.cli:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/checkwash_prove"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
