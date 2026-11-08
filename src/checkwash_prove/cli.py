@@ -8,6 +8,7 @@ from __future__ import annotations
 import argparse
 import codecs
 import json
+import math
 import os
 import re
 import shutil
@@ -79,9 +80,12 @@ def _advise(text: str) -> None:
 
 
 def _git_read(repo: str, args: list[str]) -> bytes:
+    # Without Git's location variables (GIT_DIR from a hook): --repo names the repository.
+    from checkwash_prove.engine import _clean_env
+
     try:
         proc = subprocess.run(["git", "-C", repo, *args], capture_output=True, check=False, timeout=60,
-                              stdin=subprocess.DEVNULL)
+                              stdin=subprocess.DEVNULL, env=_clean_env())
     except (OSError, subprocess.TimeoutExpired) as exc:
         raise GitError("git read could not complete") from exc
     if proc.returncode != 0:
@@ -163,6 +167,22 @@ def exit_code(report: dict, fail_on_loss: bool) -> int:
     return 0
 
 
+def _seconds(text: str) -> float:
+    value = float(text)
+    if not math.isfinite(value) or value <= 0:
+        raise argparse.ArgumentTypeError(f"needs a number of seconds above 0, got {text!r}")
+    return value
+
+
+def _count(least: int):
+    def parse(text: str) -> int:
+        value = int(text)
+        if value < least:
+            raise argparse.ArgumentTypeError(f"needs a whole number of at least {least}, got {text!r}")
+        return value
+    return parse
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog=NAME,
@@ -180,22 +200,24 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--python", default=None, help="interpreter that runs the tests (default: this one)")
     parser.add_argument("--import-root", default=None,
                         help="directory under the root that holds the product packages (default: src if present)")
-    parser.add_argument("--workers", type=int, default=1,
+    parser.add_argument("--workers", type=_count(1), default=1,
                         help="mutant runs side by side (default 1; tests that share ports or files can interfere)")
-    parser.add_argument("--timeout", type=float, default=DEFAULT_TIMEOUT,
+    parser.add_argument("--timeout", type=_seconds, default=DEFAULT_TIMEOUT,
                         help="least seconds a run against one mutant gets; it gets three times its clean run's "
                              "time plus 10 when that is more (default 30)")
-    parser.add_argument("--suite-timeout", type=float, default=DEFAULT_SUITE_TIMEOUT,
+    parser.add_argument("--suite-timeout", type=_seconds, default=DEFAULT_SUITE_TIMEOUT,
                         help="most seconds a clean run gets (default 900)")
-    parser.add_argument("--max-mutants", type=int, default=200, help="cap on mutants run (default 200)")
+    parser.add_argument("--max-mutants", type=_count(0), default=200, help="cap on mutants run (default 200)")
     parser.add_argument("--only", metavar="ID", help="run one mutant, e.g. src/pkg/mod.py:467:8:PY-ASRS-X:2")
     parser.add_argument("--list", action="store_true",
                         help="list the mutants with their ids, in run order, without running them")
     parser.add_argument("--strict-warnings", action="store_true",
                         help="keep DeprecationWarning settings when old tests run on the new code")
     parser.add_argument("--fail-on-loss", action="store_true",
-                        help="exit 1 when a protection loss is found, 2 when nothing could be compared")
-    parser.add_argument("--keep", action="store_true", help="keep the temporary trees")
+                        help="exit 1 when a protection loss is found; 2 when the comparison did not happen or "
+                             "part of it could not be decided; 0 otherwise, 'nothing to compare' included")
+    parser.add_argument("--keep", action="store_true",
+                        help="keep the temporary trees (their directory is printed on standard error)")
     return parser
 
 

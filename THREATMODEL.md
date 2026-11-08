@@ -20,8 +20,12 @@ experimental.
   exceptions Git makes: in a partial clone (`--filter`), reading an object
   the clone lacks fetches it from the remote, through your credential
   helper, and stores it under `.git`; and a checkout filter such as Git
-  LFS's may fetch from its server (below). The code it runs is another
-  matter.
+  LFS's may fetch from its server (below). Git's variables that name a
+  repository, an index or a work tree (`GIT_DIR`, `GIT_WORK_TREE`,
+  `GIT_INDEX_FILE` and the like, which a Git hook sets) are removed from its
+  own Git commands and from the environment of the tests it runs, so a run
+  started from a hook does not aim either at your repository. The code it
+  runs is another matter.
 - **A loss can be checked by anyone.** Every protection loss names the
   catalogue mutant and comes with the command that replays that one mutant.
   A loss is reported only after the old tests caught the mutant, the new
@@ -45,15 +49,20 @@ absolute path), read your environment and credentials, use the network,
 and start processes. The run hygiene below exists so that runs do not
 disturb each other's results. It is not a security boundary:
 
-- every run works in a copy of a pristine tree, put back and checked after
-  the run. Putting it back removes a symbolic link or junction a test left
-  without following it (on Windows, clearing the link's own read-only
-  attribute first if it has to), and changes a file's mode only on Windows,
-  where a read-only file cannot be deleted, and only when no hard link shares
-  the file with one elsewhere. On POSIX it gives the tree's own directories,
-  never a link's target, their owner's permissions back. A link it still
-  cannot remove is left alone, with nothing written through it, and the run
-  stops;
+- every run works in a copy of a pristine tree, put back and checked before
+  the next run; at the end the work directory is removed, with what the last
+  runs left (read-only files, directories without their owner's
+  permissions) made removable first. Putting a tree back removes a symbolic
+  link or junction a test left without following it (on Windows, clearing
+  the link's own read-only attribute first if it has to), and changes a
+  file's mode only on Windows, where a read-only file cannot be deleted, and
+  only when no hard link shares the file with one elsewhere. A file a test
+  hard-linked to another name is replaced, never written into, and a mutant
+  is written as a new file, so nothing written to the tree reaches a file
+  that another name shares. On POSIX it gives the tree's own directories,
+  never a link's target, their owner's permissions back. A link or file it
+  still cannot remove is left alone, with nothing written through or into
+  it, and the run stops;
 - each run gets its own pytest cache outside the tree, `PYTEST_ADDOPTS`
   cleared, `--confcutdir` at the tree, and `-p no:randomly`;
 - every run has a time budget; at its end, or at a timeout, everything in

@@ -16,6 +16,7 @@ Nothing here is an opinion: every finding comes from test runs and can be replay
 """
 from __future__ import annotations
 
+import ast
 import dataclasses
 import fnmatch
 import hashlib
@@ -23,7 +24,6 @@ import importlib.resources
 import json
 import os
 import pathlib
-import posixpath
 import re
 import shlex
 import shutil
@@ -165,19 +165,23 @@ def pytest_collectstart(collector):
 
 
 _errors = []
+_skipped = []
 
 
 def pytest_collectreport(report):
     _mark("c", report.nodeid)
-    # A test file that fails to import is still part of the suite: its run fails on it.
+    # A test file that fails to import, or a directory whose conftest.py or __init__.py does, is still part of the
+    # suite: its run fails on it. So is a test file that skips itself as a whole while it is collected.
     if report.failed:
         _errors.append(report.nodeid)
+    elif report.skipped and "::" not in report.nodeid and report.nodeid.endswith(".py"):
+        _skipped.append(report.nodeid)
 
 
 def pytest_collection_finish(session):
     if _COLLECT:
         with open(_COLLECT, "w", encoding="utf-8") as fh:
-            json.dump({"items": [item.nodeid for item in session.items], "errors": _errors}, fh)
+            json.dump({"items": [item.nodeid for item in session.items], "errors": _errors, "skipped": _skipped}, fh)
 
 
 def pytest_runtest_logstart(nodeid, location):
@@ -186,12 +190,16 @@ def pytest_runtest_logstart(nodeid, location):
     _mark("S", nodeid)
 
 
-@pytest.hookimpl(tryfirst=True)
-def pytest_runtest_teardown(item, nextitem):
-    # Before the last test of a file, or of the run, module- and session-scoped fixtures end too: from here a hang or
-    # a death belongs to the run, not to this test.
-    if nextitem is None or nextitem.nodeid.split("::")[0] != item.nodeid.split("::")[0]:
-        _mark("W", item.nodeid)
+@pytest.hookimpl(trylast=True)
+def pytest_runtest_setup(item):
+    # Fixtures that several tests share (class, module, package or session scope) end when their node is torn down,
+    # after the test's own fixtures. A finalizer added to each node now runs there before theirs: from that point a
+    # hang or a death belongs to the run, not to this test.
+    for node in item.listchain()[:-1]:
+        try:
+            node.addfinalizer(lambda nodeid=item.nodeid: _mark("W", nodeid))
+        except Exception:
+            pass
 
 
 def pytest_runtest_logfinish(nodeid, location):
@@ -345,6 +353,9 @@ _SECTION = re.compile(r"^\s*\[([^\]]+)\]\s*$")
 def _ini_section(text: str, section: str) -> str | None:
     lines, inside, found = [], False, False
     for line in text.splitlines():
+        # As pytest's ini parser: a line that starts with # or ; after its indentation is a comment, wherever it is.
+        if line.lstrip()[:1] in ("#", ";"):
+            continue
         head = _SECTION.match(line)
         if head:
             inside = head.group(1).strip() == section
@@ -400,15 +411,40 @@ def _words(value) -> tuple[str, ...]:
     return tuple(str(v) for v in value) if isinstance(value, list) else tuple(str(value).split())
 
 
-def naming_rules(repo: str, revs: tuple[str, ...]) -> tuple[Naming, ...]:
+def pytest_version(python: str) -> tuple[int, ...] | None:
+    """The version of pytest in the interpreter that runs the tests, or None when it cannot be read."""
+    try:
+        # From a directory of its own: nothing in the current directory is imported in pytest's place.
+        with tempfile.TemporaryDirectory(prefix="checkwash-prove-version-") as tmp:
+            proc = subprocess.run([python, "-c", "import pytest; print(pytest.__version__)"], cwd=tmp,
+                                  env=_clean_env(), capture_output=True, timeout=120)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    found = re.match(rb"\s*(\d+)\.(\d+)", proc.stdout) if proc.returncode == 0 else None
+    return (int(found.group(1)), int(found.group(2))) if found else None
+
+
+def config_names_for(version: tuple[int, ...] | None) -> tuple[str, ...]:
+    """The configuration files a pytest version looks for, in its order: pytest.toml and .pytest.toml from 9.0,
+    .pytest.ini from 7.1. With the version unknown, pytest 9's."""
+    names = CONFIG_NAMES
+    if version is not None and version < (9, 0):
+        names = tuple(n for n in names if n not in ("pytest.toml", ".pytest.toml"))
+    if version is not None and version < (7, 1):
+        names = tuple(n for n in names if n != ".pytest.ini")
+    return names
+
+
+def naming_rules(repo: str, revs: tuple[str, ...], names: tuple[str, ...] = CONFIG_NAMES) -> tuple[Naming, ...]:
     """How the repository root's pytest configuration names test modules at each of these revisions: its
     python_files (pytest's default when it sets none) and its testpaths. pytest collects test modules by these, so a
     project that sets them (pytest-django's `tests.py`) has its test modules found by them too, and a broad pattern
-    reaches only the testpaths."""
+    reaches only the testpaths. Testpaths that match nothing at a revision are left out, as pytest then searches
+    from the root instead."""
     rules: list[Naming] = []
     for rev in revs:
         files = paths = None
-        for name in CONFIG_NAMES:
+        for name in names:
             data = blob(repo, rev, name)
             if pytest_settings(name, data) is None:
                 continue
@@ -418,17 +454,23 @@ def naming_rules(repo: str, revs: tuple[str, ...]) -> tuple[Naming, ...]:
             except tomllib.TOMLDecodeError:
                 pass
             break
-        rule = Naming(_words(files) or PYTHON_FILES, _words(paths))
+        testpaths = _words(paths)
+        if testpaths:
+            existing = tree_files(repo, rev, [""])
+            if not any(_under(p, t) for t in testpaths for p in existing):
+                testpaths = ()
+        rule = Naming(_words(files) or PYTHON_FILES, testpaths)
         if rule not in rules:
             rules.append(rule)
     return tuple(rules) or DEFAULT_NAMING
 
 
-def _walk_for_config(start: pathlib.Path, tree: pathlib.Path) -> tuple[pathlib.Path | None, pathlib.Path | None]:
+def _walk_for_config(start: pathlib.Path, tree: pathlib.Path,
+                     names: tuple[str, ...] = CONFIG_NAMES) -> tuple[pathlib.Path | None, pathlib.Path | None]:
     """(configuration, first pyproject.toml seen) from start up to the tree's root, never above it."""
     pyproject, base = None, start
     while True:
-        for name in CONFIG_NAMES:
+        for name in names:
             path = base / name
             if path.is_file():
                 if name == "pyproject.toml" and pyproject is None:
@@ -440,16 +482,17 @@ def _walk_for_config(start: pathlib.Path, tree: pathlib.Path) -> tuple[pathlib.P
         base = base.parent
 
 
-def locate_config(tree: pathlib.Path, args: list[str]) -> pathlib.Path | None:
-    """The configuration file pytest would use for these arguments, as pytest 9 looks for it, but only inside the
-    tree: from the arguments' common ancestor up; failing that, and with no setup.py there, from each argument."""
+def locate_config(tree: pathlib.Path, args: list[str], names: tuple[str, ...] = CONFIG_NAMES) -> pathlib.Path | None:
+    """The configuration file pytest would use for these arguments, as pytest looks for it (the names its version
+    reads), but only inside the tree: from the arguments' common ancestor up; failing that, and with no setup.py
+    there, from each argument."""
     dirs = []
     for arg in args:
         path = tree / arg
         if path.exists():
             dirs.append(path if path.is_dir() else path.parent)
     ancestor = pathlib.Path(os.path.commonpath([str(d) for d in dirs])) if dirs else tree
-    found, pyproject = _walk_for_config(ancestor, tree)
+    found, pyproject = _walk_for_config(ancestor, tree, names)
     if found:
         return found
     if pyproject is None and dirs and dirs != [ancestor]:
@@ -457,7 +500,7 @@ def locate_config(tree: pathlib.Path, args: list[str]) -> pathlib.Path | None:
         while not (base / "setup.py").is_file():
             if base == tree or base.parent == base:
                 for start in dirs:
-                    found, seen = _walk_for_config(start, tree)
+                    found, seen = _walk_for_config(start, tree, names)
                     if found:
                         return found
                     pyproject = pyproject or seen
@@ -468,24 +511,40 @@ def locate_config(tree: pathlib.Path, args: list[str]) -> pathlib.Path | None:
 
 # ---- git -----------------------------------------------------------------------------------------------------------
 
+# Git's variables that name a repository, an index or a work tree. A Git hook or alias that starts checkwash-prove
+# sets some of them (a pre-commit hook sets GIT_INDEX_FILE): they would point its own Git commands, and the Git
+# commands of the tests it runs in its temporary trees, at the caller's repository.
+GIT_LOCATION_VARIABLES = ("GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE", "GIT_OBJECT_DIRECTORY",
+                          "GIT_ALTERNATE_OBJECT_DIRECTORIES", "GIT_COMMON_DIR", "GIT_NAMESPACE", "GIT_PREFIX",
+                          "GIT_QUARANTINE_PATH")
+
+
+def _clean_env(**extra: str) -> dict[str, str]:
+    """The caller's environment without Git's location variables, plus extra."""
+    env = {k: v for k, v in os.environ.items() if k.upper() not in GIT_LOCATION_VARIABLES}
+    env.update(extra)
+    return env
+
+
 def _git(repo: str, *args: str, env: dict[str, str] | None = None, input: bytes | None = None,
          ok: tuple[int, ...] = (0,)) -> bytes:
     proc = subprocess.run(["git", "-c", "core.autocrlf=false", "-c", "core.quotepath=false", *args], cwd=repo,
-                          capture_output=True, env=env, input=input)
+                          capture_output=True, env=env if env is not None else _clean_env(), input=input)
     if proc.returncode not in ok:
         raise ProveError(f"git {' '.join(args)} failed: {proc.stderr.decode('utf-8', 'replace').strip()}")
     return proc.stdout
 
 
 def _git_code(repo: str, *args: str) -> int:
-    return subprocess.run(["git", *args], cwd=repo, capture_output=True).returncode
+    return subprocess.run(["git", *args], cwd=repo, capture_output=True, env=_clean_env()).returncode
 
 
 def parse_range(spec: str) -> tuple[str, str, bool] | None:
-    """(base, head, three_dot) for BASE..HEAD or BASE...HEAD; None for anything else."""
+    """(base, head, three_dot) for BASE..HEAD or BASE...HEAD; None for anything else, `a..b..c` included (a Git
+    revision never holds `..`)."""
     three = "..." in spec
     base, dots, head = spec.partition("..." if three else "..")
-    if not dots or not base or not head or head.startswith("."):
+    if not dots or not base or not head or head.startswith(".") or ".." in base or ".." in head:
         return None
     return base, head, three
 
@@ -541,8 +600,50 @@ def tree_files(repo: str, rev: str, dirs: list[str]) -> list[str]:
     return [n for n in names if n]
 
 
+def _module_names(path: str) -> set[str]:
+    """The names a test module can be imported by: dotted from the root, and its own name (pytest puts a test
+    module's directory on sys.path when it is not in a package)."""
+    dotted = path[:-3].replace("/", ".")
+    return {dotted, dotted.rsplit(".", 1)[-1]}
+
+
+def _importers(repo: str, rev: str, changed: list[str],
+               naming: tuple[Naming, ...] = DEFAULT_NAMING) -> list[tuple[str, str]]:
+    """(unchanged test module, changed test module it imports) at rev, within the test directories of the changed
+    modules: a changed module can be a library of others (base classes, helpers)."""
+    if not changed:
+        return []
+    wanted = {name: path for path in changed for name in _module_names(path)}
+    dirs = sorted({scope_dir(p) for p in changed})
+    out = []
+    for path in tree_files(repo, rev, dirs):
+        if path in changed or not is_test_module(path, naming):
+            continue
+        try:
+            tree = ast.parse(blob(repo, rev, path) or b"")
+        except (SyntaxError, ValueError):
+            continue
+        package = path.rsplit("/", 1)[0].replace("/", ".") if "/" in path else ""
+        hits = set()
+        for node in ast.walk(tree):
+            names = []
+            if isinstance(node, ast.Import):
+                names = [a.name for a in node.names]
+            elif isinstance(node, ast.ImportFrom):
+                base = node.module or ""
+                if node.level:
+                    parts = package.split(".") if package else []
+                    parts = parts[:len(parts) - (node.level - 1)] if node.level > 1 else parts
+                    base = ".".join(p for p in [*parts, base] if p)
+                names = [base] + [f"{base}.{a.name}" if base else a.name for a in node.names]
+            hits.update(wanted[n] for n in names if n in wanted)
+        out.extend((path, hit) for hit in sorted(hits))
+    return out
+
+
 def blob(repo: str, rev: str, path: str) -> bytes | None:
-    proc = subprocess.run(["git", "cat-file", "blob", f"{rev}:{path}"], cwd=repo, capture_output=True)
+    proc = subprocess.run(["git", "cat-file", "blob", f"{rev}:{path}"], cwd=repo, capture_output=True,
+                          env=_clean_env())
     return proc.stdout if proc.returncode == 0 else None
 
 
@@ -550,7 +651,7 @@ def checkout(repo: str, rev: str, dest: pathlib.Path, paths: list[str] | None = 
     """Files of rev as `git checkout` writes them (filters and line endings applied), under dest."""
     dest.mkdir(parents=True, exist_ok=True)
     with tempfile.TemporaryDirectory(prefix="checkwash-prove-index-") as tmp:
-        env = dict(os.environ, GIT_INDEX_FILE=os.path.join(tmp, "index"))
+        env = _clean_env(GIT_INDEX_FILE=os.path.join(tmp, "index"))
         # --work-tree lets a bare repository check out too; --prefix decides where the files go.
         _git(repo, f"--work-tree={tmp}", "read-tree", rev, env=env)
         if paths is None:
@@ -574,13 +675,14 @@ def _is_link(path) -> bool:
     return bool(getattr(st, "st_file_attributes", 0) & getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0))
 
 
-def _signature(st: os.stat_result) -> tuple[int, int, int]:
-    # The mode too: a test that makes a file read-only leaves its size and time alone.
-    return st.st_size, st.st_mtime_ns, stat.S_IMODE(st.st_mode)
+def _signature(st: os.stat_result) -> tuple[int, int, int, int]:
+    # The mode too: a test that makes a file read-only leaves its size and time alone. And the link count: a file a
+    # test hard-linked elsewhere is put back as a new file, so nothing written to the tree reaches the other name.
+    return st.st_size, st.st_mtime_ns, stat.S_IMODE(st.st_mode), st.st_nlink
 
 
-def _scan(root: pathlib.Path) -> tuple[dict[str, tuple[int, int, int]], set[str]]:
-    files: dict[str, tuple[int, int, int]] = {}
+def _scan(root: pathlib.Path) -> tuple[dict[str, tuple[int, int, int, int]], set[str]]:
+    files: dict[str, tuple[int, int, int, int]] = {}
     dirs: set[str] = set()
     for current, dirnames, filenames in os.walk(root):
         rel_dir = os.path.relpath(current, root)
@@ -646,6 +748,54 @@ def _remove(path: pathlib.Path) -> None:
             pass
 
 
+def _owner_rwx(path: pathlib.Path) -> None:
+    """POSIX: give one of the tree's own directories its owner's permissions back. Through a descriptor opened
+    without following a link where the directory can be opened, so a link a leftover process swaps in meanwhile is
+    never followed; by name only for a directory its owner cannot read."""
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    except OSError:
+        fd = None
+    try:
+        st = os.fstat(fd) if fd is not None else os.lstat(path)
+        if stat.S_ISDIR(st.st_mode) and st.st_mode & stat.S_IRWXU != stat.S_IRWXU:
+            mode = stat.S_IMODE(st.st_mode) | stat.S_IRWXU
+            if fd is not None:
+                os.fchmod(fd, mode)
+            else:
+                os.chmod(path, mode)
+    except OSError:
+        pass
+    finally:
+        if fd is not None:
+            os.close(fd)
+
+
+def remove_workdir(work: pathlib.Path) -> None:
+    """Remove the work directory whatever the last run in each tree left: read-only files (Windows) and
+    directories without their owner's permissions (POSIX) are made removable first, never through a link."""
+    if os.name != "nt" and not os.path.islink(work):
+        _owner_rwx(work)
+    for current, dirnames, filenames in os.walk(work):
+        for name in list(dirnames):
+            path = os.path.join(current, name)
+            if _is_link(path):
+                dirnames.remove(name)
+                _link_writable(pathlib.Path(path))
+            elif os.name != "nt":
+                _owner_rwx(pathlib.Path(path))
+        if os.name == "nt":
+            for name in filenames:
+                path = os.path.join(current, name)
+                try:
+                    st = os.lstat(path)
+                    if not st.st_mode & stat.S_IWRITE and st.st_nlink == 1 and not _is_link(path):
+                        os.chmod(path, stat.S_IWRITE | stat.S_IREAD)
+                except OSError:
+                    pass
+    shutil.rmtree(work, ignore_errors=True)
+
+
 class Tree:
     """A copy of a pristine tree, put back to that pristine state before every run in it."""
 
@@ -660,12 +810,7 @@ class Tree:
             # A directory a test left unwritable keeps what is in it; the tree's own directories, never a link's
             # target, get their owner's permissions back.
             for rel in [".", *dirs]:
-                try:
-                    st = os.lstat(self.path / rel)
-                    if stat.S_ISDIR(st.st_mode) and st.st_mode & stat.S_IRWXU != stat.S_IRWXU:
-                        os.chmod(self.path / rel, stat.S_IMODE(st.st_mode) | stat.S_IRWXU)
-                except OSError:
-                    pass
+                _owner_rwx(self.path / rel)
         for rel, sig in files.items():
             if self.files.get(rel) != sig:
                 _remove(self.path / rel)
@@ -681,7 +826,10 @@ class Tree:
                 target.parent.mkdir(parents=True, exist_ok=True)
                 if target.exists() or _is_link(target):
                     _remove(target)
-                if _is_link(target):
+                if target.exists() or _is_link(target):
+                    # Still there (held open, or a read-only file another name shares): copying would write into
+                    # it, and through a hard link to a file outside the tree. The tree stays different, and
+                    # reset() tries again or stops the run.
                     continue
                 shutil.copy2(self.pristine / rel, target, follow_symlinks=False)
 
@@ -711,7 +859,12 @@ class Tree:
             raise ProveError(f"could not put {self.path} back to its pristine state ({', '.join(stray[:5])}): a process "
                              "the tests started may still be running")
         if mutant is not None:
-            (self.path / mutant.path).write_bytes(mutant.apply((self.pristine / mutant.path).read_bytes()))
+            # A new file put in place, not the old one rewritten: whatever else may share that file keeps its bytes.
+            target = self.path / mutant.path
+            fresh = target.with_name(target.name + ".checkwash-prove-new")
+            fresh.write_bytes(mutant.apply((self.pristine / mutant.path).read_bytes()))
+            shutil.copymode(self.pristine / mutant.path, fresh)
+            os.replace(fresh, target)
 
 
 def junit_key(nodeid: str) -> tuple[str, str]:
@@ -737,7 +890,8 @@ def _tree_key(key: tuple[str, str], prefix: str) -> tuple[str, str]:
 
 def _running(progress: pathlib.Path) -> list[tuple[str, str]]:
     """What a run had started and not finished, from the plugin's progress lines, innermost last: ("C", a test file
-    being collected), ("S", a test), or ("W", a test whose teardown ends module- or session-scoped fixtures too)."""
+    being collected), ("S", a test), or ("W", a test after whose own teardown fixtures that several tests share, of
+    class, module, package or session scope, are being torn down)."""
     try:
         lines = progress.read_text(encoding="utf-8", errors="replace").splitlines()
     except OSError:
@@ -916,13 +1070,15 @@ def _failure_line(message: str, text: str) -> str:
 _XDIST_OPTION = re.compile(r"(?<![\w-])(--numprocesses|--dist|--tx)(?![\w-])"
                            r"|(?<![\w-])-[A-Za-z]*n(?:\d|auto(?![\w-])|logical(?![\w-])|(?![\w-]))")
 _COV_OPTION = re.compile(r"(?<![\w-])--cov(?![\w-])")
+_DOCTEST_OPTION = re.compile(r"(?<![\w-])--doctest-(modules|glob)(?![\w-])")
 # Stepwise ends a run at its first failure; --sw-skip and --sw-reset turn it on too, and no option turns it off.
 _STEPWISE_OPTION = re.compile(r"(?<![\w-])(--sw|--stepwise)(-skip|-reset)?(?![\w-])")
 
 
 class Runner:
-    def __init__(self, opts: Options, import_root: str, work: pathlib.Path):
-        self.opts, self.import_root = opts, import_root
+    def __init__(self, opts: Options, import_root: str, work: pathlib.Path,
+                 config_names: tuple[str, ...] = CONFIG_NAMES):
+        self.opts, self.import_root, self.config_names = opts, import_root, config_names
         self.plugin_dir, self.scratch = work / "plugin", work / "scratch"
         self.plugin_dir.mkdir()
         self.scratch.mkdir()
@@ -942,7 +1098,9 @@ class Runner:
 
     def env(self, tree: pathlib.Path, trace_out: pathlib.Path | None = None, only: pathlib.Path | None = None,
             collect_out: pathlib.Path | None = None, progress: pathlib.Path | None = None) -> dict[str, str]:
-        env = dict(os.environ, PYTHONDONTWRITEBYTECODE="1")
+        # Without Git's location variables: a test's Git commands in the temporary tree must not reach the caller's
+        # repository or index.
+        env = _clean_env(PYTHONDONTWRITEBYTECODE="1")
         # The project's own configuration decides how its tests run, not options from the caller's shell.
         env.pop("PYTEST_ADDOPTS", None)
         for key in ("CHECKWASH_PROVE_TRACE_OUT", "CHECKWASH_PROVE_TRACE_ROOT", "CHECKWASH_PROVE_ONLY",
@@ -972,7 +1130,7 @@ class Runner:
         progress = self.scratch / f"progress-{n}.txt"
         args, only = list(files), None
         # The configuration is the one pytest would use for the files themselves, however they are passed.
-        config = locate_config(tree, args)
+        config = locate_config(tree, args, self.config_names)
         if sum(len(a) + 1 for a in args) > ARGS_LIMIT:
             only = self.scratch / f"only-{n}.txt"
             only.write_text("".join(os.path.realpath(tree / a) + "\n" for a in args), encoding="utf-8")
@@ -1069,9 +1227,14 @@ def _killed(clean: RunResult, run: RunResult, collected: Collected | None = None
     A timeout is a catch, given a budget well over the clean run's time; so is a run that wrote no results where the
     clean run had passes, or, with no failing test to explain it, a nonzero exit the clean run did not have. The
     plugin's progress lines name the test, or the test file being collected, that the run was in when it hung or
-    died, and that one must count for the run to be a catch. A run that was in none, or in a teardown that ends
-    module- or session-scoped fixtures, failed as a whole, as CI's would. In a run of some of the suite's files
-    (`subset`), exit 5, no test ran, is no catch: the whole suite runs others and passes.
+    died, and that one must count for the run to be a catch. A run that was in none failed as a whole, as CI's
+    would. One in the teardown of fixtures that several tests share (class, module, package or session scope) failed
+    as a whole for the new tests and the whole suite (`ambiguous_counts`), and in the last test that used them for the
+    old tests. In a run of some of the suite's files (`subset`), exit 5, no test ran, is no catch: the whole suite runs
+    others and passes.
+
+    A test class whose collection fails now (a parameter id or a generated test the mutant broke) counts when the
+    clean run passed or skipped any of its tests.
 
     A test the clean run has no result for (a mutant changed its parameter id) counts when the clean run passed its
     other instances. With none to go by it is ambiguous: no catch for the old tests, since a loss needs the old tests
@@ -1097,7 +1260,17 @@ def _killed(clean: RunResult, run: RunResult, collected: Collected | None = None
         if state is None:
             base = name.partition("[")[0]
             siblings = [v for (c, n), v in clean.outcomes.items() if c == cls and n.partition("[")[0] == base]
-            if not siblings or "failed" in siblings:
+            if not siblings:
+                # A test class's own entry: its collection failed (JUnit names it module, class).
+                klass = f"{cls}.{name}"
+                members = [v for (c, _n), v in clean.outcomes.items() if c == klass or c.startswith(klass + ".")]
+                if not members:
+                    return None
+                if "passed" not in members and "skipped" not in members:
+                    return False
+                whole = _tree_key((klass, ""), run.prefix)[0]
+                return collected is None or any(c == whole or c.startswith(whole + ".") for c, _n in collected.keys)
+            if "failed" in siblings:
                 return None
             return collected is None or _tree_key((cls, base), run.prefix) in collected.bases
         return collected is None or _tree_key(key, run.prefix) in collected.keys
@@ -1119,10 +1292,13 @@ def _killed(clean: RunResult, run: RunResult, collected: Collected | None = None
     else:
         whole = None
     if whole is not None:
-        if not run.running or run.running[-1][0] == "W":
+        # In the teardown of shared fixtures the hang belongs to no one test: the run's for the new tests and the
+        # whole suite, the last test's for the old tests, so an unclear hang never makes a loss.
+        if not run.running or (run.running[-1][0] == "W" and ambiguous_counts):
             return [f"({whole})"]
         kind, nodeid = run.running[-1]
-        key = junit_key(nodeid) if kind == "S" else ("", re.sub(r"\.py$", "", nodeid.split("::")[0].replace("/", ".")))
+        key = (junit_key(nodeid) if kind in ("S", "W")
+               else ("", re.sub(r"\.py$", "", nodeid.split("::")[0].replace("/", "."))))
         verdict = counts(key)
         if verdict:
             return [f"{_label(key)} ({whole})"]
@@ -1169,11 +1345,17 @@ def _executed(trace_out: pathlib.Path, tree: pathlib.Path,
 @dataclasses.dataclass
 class Collected:
     """What a tree's own whole-suite collection holds, all named from the tree's root: test files, JUnit keys, the
-    same keys without their parameter ids, and modules."""
+    same keys without their parameter ids, modules, and the directories whose collection failed ("" for all)."""
     files: set[str]
     keys: set[tuple[str, str]]
     bases: set[tuple[str, str]]
     modules: set[str]
+    dirs: set[str] = dataclasses.field(default_factory=set)
+
+    def holds(self, path: str) -> bool:
+        """Whether the suite holds a test file: it collected it, failed to collect it or the directory above it, or
+        skipped it as a whole."""
+        return path in self.files or any(d == "" or path == d or path.startswith(d + "/") for d in self.dirs)
 
 
 def _collect(runner: Runner, tree: Tree, opts: Options, *, old_side: bool) -> Collected | None:
@@ -1184,15 +1366,25 @@ def _collect(runner: Runner, tree: Tree, opts: Options, *, old_side: bool) -> Co
         return None
     found = json.loads(out.read_text(encoding="utf-8"))
     nodeids = found["items"]
-    # Files that failed to collect are the suite's too: its run fails on them, as an old module that no longer
-    # imports on the new code does.
-    errors = [n for n in found["errors"] if n and n.split("::")[0].endswith(".py")]
     prefix = os.path.relpath(result.rootdir or tree.path, tree.path).replace(os.sep, "/")
     prefix = "" if prefix == "." else prefix + "/"
+    # What failed to collect is the suite's too: its run fails on it, as an old module that no longer imports on the
+    # new code does. A directory fails as a whole when its conftest.py or __init__.py does not import; a test file
+    # that skips itself while it is collected is the suite's as well.
+    modules, dirs = [], set()
+    for nodeid in found["errors"]:
+        path = nodeid.split("::")[0]
+        if path.endswith(".py") and path.rsplit("/", 1)[-1] != "__init__.py":
+            modules.append(path)
+            continue
+        if path.endswith(".py"):
+            path = path.rsplit("/", 1)[0] if "/" in path else ""
+        dirs.add((prefix + path).rstrip("/") if path else prefix.rstrip("/"))
+    modules += [n.split("::")[0] for n in found.get("skipped", [])]
     keys = {_tree_key(junit_key(n), result.prefix) for n in nodeids}
-    return Collected({prefix + n.split("::")[0] for n in nodeids + errors}, keys,
-                     {(c, n.partition("[")[0]) for c, n in keys},
-                     {result.prefix + re.sub(r"\.py$", "", n.split("::")[0].replace("/", ".")) for n in nodeids + errors})
+    files = [n.split("::")[0] for n in nodeids] + modules
+    return Collected({prefix + f for f in files}, keys, {(c, n.partition("[")[0]) for c, n in keys},
+                     {result.prefix + re.sub(r"\.py$", "", f.replace("/", ".")) for f in files}, dirs)
 
 
 def node_id(tree: pathlib.Path, rootdir: pathlib.Path | None, classname: str, name: str) -> str:
@@ -1310,7 +1502,12 @@ def _candidates(tree, import_root, old_exec, new_exec, changed, report,
             continue
         try:
             muts = file_mutants((tree / rel).read_bytes(), old_all[rel])
-        except (SyntaxError, ValueError, OSError) as exc:
+        except SyntaxError as exc:
+            report["notes"].append(f"{rel}: not mutated ({exc}); the catalogue reads product files with the Python "
+                                   f"running checkwash-prove ({sys.version_info[0]}.{sys.version_info[1]}), so run "
+                                   "it with one as new as the project's syntax")
+            continue
+        except (ValueError, OSError) as exc:
             report["notes"].append(f"{rel}: not mutated ({exc})")
             continue
         good = old_good.get(rel, set())
@@ -1386,6 +1583,8 @@ def prove(repo: str, spec: str, opts: Options) -> dict:
         "tool": "checkwash-prove", "experimental": True,
         "catalogue": {"version": CATALOGUE_VERSION, "generator_sha256": digest},
         "range": spec, "base": base, "head": head, "from_merge_base": three, "python": opts.python,
+        # The catalogue parses product files with the Python running checkwash-prove.
+        "host_python": ".".join(map(str, sys.version_info[:3])),
         "options": {k: v for k, v in dataclasses.asdict(opts).items() if k not in ("python", "replay")},
         "needs_clarification": [], "protection_losses": [], "unconfirmed_losses": [], "notes": [], "mutation": {},
         "compared": False, "nothing_to_compare": False,
@@ -1398,29 +1597,32 @@ def prove(repo: str, spec: str, opts: Options) -> dict:
     submodules = sorted(c.path for c in changes if c.gitlink)
     if submodules:
         report["notes"].append("submodules are not compared: " + ", ".join(submodules))
-    naming = naming_rules(repo, (base, head))
+    # The configuration files the tests' pytest reads: pytest.toml from pytest 9, .pytest.ini from pytest 7.1.
+    version = pytest_version(opts.python)
+    report["pytest_version"] = ".".join(map(str, version)) if version else None
+    config_names = config_names_for(version)
+    naming = naming_rules(repo, (base, head), config_names)
     suite = _suite_changes(repo, base, head, [c for c in changes if not c.gitlink], naming)
     modules = [c for c in suite if is_test_module(c.path, naming)]
     others = [c for c in suite if not is_test_module(c.path, naming)]
     old_tests = sorted(c.path for c in modules if c.status != "A")
     new_tests = sorted(c.path for c in modules if c.status != "D")
-    # When no test module that existed before changed (only helpers, data or configuration, perhaps with added
-    # modules), the change is compared through the unchanged modules a changed file can affect; each side keeps only
-    # those its own whole-suite run collects (_prove_in). When existing modules changed too, those are compared, and
-    # the unchanged ones are not: under a changed conftest.py that would be the whole suite on every run.
+    # The unchanged modules a changed helper, data or configuration file can affect. They are compared through it only
+    # when no changed test module that existed before is in the old suite (_prove_in decides, after collection): when
+    # one is, it is compared and the unchanged ones are not, since under a changed conftest.py that would be the whole
+    # suite on every run.
     through: tuple[set[str], set[str]] = (set(), set())
-    if others and all(c.status == "A" for c in modules):
+    if others:
         dirs = sorted({scope_dir(c.path) for c in others})
         through = ({p for p in tree_files(repo, base, dirs) if is_test_module(p, naming)} - set(old_tests),
                    {p for p in tree_files(repo, head, dirs) if is_test_module(p, naming)} - set(new_tests))
-        old_tests, new_tests = sorted(set(old_tests) | through[0]), sorted(set(new_tests) | through[1])
-        report["notes"].append("no test module that existed before changed; the changed test files ("
-                               + ", ".join(c.path for c in others) + ") are compared through the test modules under "
-                               + ", ".join(d or "the repository root" for d in dirs))
-    elif others:
-        report["notes"].append("changed test helpers, data or configuration (" + ", ".join(c.path for c in others)
-                               + "): test modules the range did not change are not compared, though some may use "
-                                 "them")
+    # A changed test module can be a library too (base classes, helpers): the unchanged modules that import it keep
+    # its old behaviour unchecked, since only changed modules are compared.
+    importers = _importers(repo, head, [c.path for c in modules if c.status == "M"], naming)
+    if importers:
+        report["notes"].append("unchanged test modules that import a changed test module are not compared, so what "
+                               "they take from it is not checked: "
+                               + ", ".join(f"{who} (imports {what})" for who, what in importers[:5]))
     product = sorted(c.path for c in changes if not c.gitlink and c.status != "D" and c.path.endswith(".py")
                      and not is_test_path(c.path, naming))
     report.update({"tests": {"old": old_tests, "new": new_tests}, "test_suite_files_changed": [c.path for c in suite],
@@ -1431,7 +1633,7 @@ def prove(repo: str, spec: str, opts: Options) -> dict:
     if not suite:
         report.update(status="nothing to compare: the range changes no test file", nothing_to_compare=True)
         return report
-    if not old_tests:
+    if not old_tests and not through[0]:
         report.update(status="nothing to compare: no test module that existed before the change is affected",
                       nothing_to_compare=True)
         return report
@@ -1440,22 +1642,27 @@ def prove(repo: str, spec: str, opts: Options) -> dict:
     report["workdir"] = str(work) if opts.keep else None
     runner = None
     try:
-        runner = Runner(opts, _import_root(opts, repo, head), work)
+        runner = Runner(opts, _import_root(opts, repo, head), work, config_names)
         return _prove_in(work, runner, repo, base, head, opts, suite, old_tests, new_tests, product, report,
-                         through, naming)
+                         through, naming, others)
     except KeyboardInterrupt:
         if runner is not None:
             runner.stop()
         raise
     finally:
-        if not opts.keep:
-            shutil.rmtree(work, ignore_errors=True)
-            if work.exists() and sys.stderr is not None:
-                try:
-                    # In a finally block: a failed write here must not replace the report being returned.
-                    sys.stderr.write(f"checkwash-prove: could not remove {work}\n")
-                except (OSError, ValueError):
-                    pass
+        message = None
+        if opts.keep:
+            message = f"checkwash-prove: kept the temporary trees in {work}"
+        else:
+            remove_workdir(work)
+            if work.exists():
+                message = f"checkwash-prove: could not remove {work}"
+        if message and sys.stderr is not None:
+            try:
+                # In a finally block: a failed write here must not replace the report being returned.
+                sys.stderr.write(message + "\n")
+            except (OSError, ValueError):
+                pass
 
 
 def _suite_changes(repo: str, base: str, head: str, changes: list[Change],
@@ -1482,12 +1689,33 @@ def normalise_root(root: str) -> str:
 
 def _import_root(opts: Options, repo: str, head: str) -> str:
     if opts.import_root:
-        return normalise_root(opts.import_root)
+        return _tree_spelling(repo, head, normalise_root(opts.import_root))
     return "src" if tree_files(repo, head, ["src"]) else "."
 
 
+def _tree_spelling(repo: str, rev: str, root: str) -> str:
+    """The import root as rev's tree spells it: on a case-insensitive file system `SRC` finds `src`, and the mutant
+    ids, their ranks and the replay command name the tree's own path. As given when no single directory matches."""
+    if root == ".":
+        return root
+    out: list[str] = []
+    for part in root.split("/"):
+        try:
+            names = [n for n in _git(repo, "ls-tree", "-z", "-d", "--name-only", f"{rev}:{'/'.join(out)}")
+                     .decode("utf-8", "replace").split("\0") if n]
+        except ProveError:
+            return root
+        if part not in names:
+            folded = [n for n in names if n.casefold() == part.casefold()]
+            if len(folded) != 1:
+                return root
+            part = folded[0]
+        out.append(part)
+    return "/".join(out)
+
+
 def _prove_in(work, runner, repo, base, head, opts, suite, old_tests, new_tests, product, report,
-              through=(set(), set()), naming=DEFAULT_NAMING):
+              through=(set(), set()), naming=DEFAULT_NAMING, others=()):
     started = time.monotonic()
     pristine_new, pristine_old = work / "pristine" / "new", work / "pristine" / "old"
     checkout(repo, head, pristine_new)
@@ -1522,22 +1750,43 @@ def _prove_in(work, runner, repo, base, head, opts, suite, old_tests, new_tests,
     # Only the modules each side's own whole-suite run collects are run. One the project excludes (collect_ignore,
     # --ignore, outside testpaths) protected nothing in CI, and named on the command line it would bring in its
     # directory's conftest.py and its fixtures, whose failures CI never sees.
+    def held(collected: Collected | None, path: str) -> bool:
+        return collected is None or collected.holds(path)
+
     left_out: tuple[list[str], list[str]] = ([], [])
-    if collected_old is not None:
-        left_out[0].extend(t for t in old_tests if t not in collected_old.files and t not in through[0])
-        old_tests = [t for t in old_tests if t in collected_old.files]
-    if collected_new is not None:
-        left_out[1].extend(t for t in new_tests if t not in collected_new.files and t not in through[1])
-        new_tests = [t for t in new_tests if t in collected_new.files]
+    left_out[0].extend(t for t in old_tests if not held(collected_old, t))
+    left_out[1].extend(t for t in new_tests if not held(collected_new, t))
+    old_tests = [t for t in old_tests if held(collected_old, t)]
+    new_tests = [t for t in new_tests if held(collected_new, t)]
+    # A changed helper, data or configuration file is compared through the unchanged modules it can affect when no
+    # changed test module that existed before is in the old suite; when one is, that one is compared instead.
+    if others:
+        changed = ", ".join(c.path for c in others)
+        if not old_tests:
+            dirs = sorted({scope_dir(c.path) for c in others})
+            old_tests = sorted(set(old_tests) | {t for t in through[0] if held(collected_old, t)})
+            new_tests = sorted(set(new_tests) | {t for t in through[1] if held(collected_new, t)})
+            report["notes"].append(f"no test module that existed before and that the old suite runs changed; the "
+                                   f"changed test files ({changed}) are compared through the test modules under "
+                                   + ", ".join(d or "the repository root" for d in dirs))
+        else:
+            report["notes"].append(f"changed test helpers, data or configuration ({changed}): test modules the range "
+                                   "did not change are not compared, though some may use them")
     report["tests"] = {"old": old_tests, "new": new_tests}
+    # The project's addopts may collect doctests: prove names test modules, so a doctest in a product module (or a
+    # --doctest-glob file) is in no run it makes.
+    if any(_DOCTEST_OPTION.search(addopts(locate_config(tree.path, [], runner.config_names)))
+           for tree in (clean_old, clean_new)):
+        report["notes"].append("the project's addopts collect doctests; prove runs named test modules only, so "
+                               "doctests in product modules and --doctest-glob files are not compared")
     for side, names in (("old", left_out[0]), ("new", left_out[1])):
         if names:
             report["notes"].append(f"changed {side} test modules that the {side} suite (a pytest run at the repository "
                                    "root) does not collect are not run, since they protect nothing in CI: "
                                    + ", ".join(names[:5]))
     if not old_tests:
-        root_config = locate_config(clean_old.path, [])
-        if any(locate_config(clean_old.path, [t]) != root_config for t in left_out[0]):
+        root_config = locate_config(clean_old.path, [], runner.config_names)
+        if any(locate_config(clean_old.path, [t], runner.config_names) != root_config for t in left_out[0]):
             report["status"] = ("not compared: pytest runs the changed old tests under a configuration file of their "
                                 "own, and a pytest run at the repository root, which prove takes as the suite, does "
                                 "not collect them")
@@ -1551,7 +1800,7 @@ def _prove_in(work, runner, repo, base, head, opts, suite, old_tests, new_tests,
     # One pytest run names every test file of a side; pytest names a file outside the rootdir it picks for them by its
     # test name alone, and no result of it could be matched.
     for side, tree, tests in (("old", clean_old, old_tests), ("new", clean_new, new_tests)):
-        config = locate_config(tree.path, tests) if tests else None
+        config = locate_config(tree.path, tests, runner.config_names) if tests else None
         rel = os.path.relpath(config.parent, tree.path).replace(os.sep, "/") if config else "."
         outside = [t for t in tests if rel != "." and not t.startswith(rel + "/")]
         if outside:
@@ -1560,6 +1809,7 @@ def _prove_in(work, runner, repo, base, head, opts, suite, old_tests, new_tests,
                                 "name them all; compare the parts apart")
             return report
 
+    subsets = (_partial(collected_old, old_tests), _partial(collected_new, new_tests))
     # Clean runs to compare against, untraced as the mutant runs are; tracing slows tests that measure time.
     clean_old.reset()
     old_clean = runner.pytest(clean_old.path, old_tests, opts.suite_timeout, old_side=True)
@@ -1600,8 +1850,8 @@ def _prove_in(work, runner, repo, base, head, opts, suite, old_tests, new_tests,
         return report
     # prove takes a pytest run at the repository root as the project's suite. Old tests that run does not collect
     # protected nothing there, unless the project runs them some other way (a configuration of their own).
-    root_config = locate_config(clean_old.path, [])
-    own = [t for t in old_tests if locate_config(clean_old.path, [t]) != root_config]
+    root_config = locate_config(clean_old.path, [], runner.config_names)
+    own = [t for t in old_tests if locate_config(clean_old.path, [t], runner.config_names) != root_config]
     if own:
         report["notes"].append("test modules that pytest runs under a configuration file other than the repository "
                                "root's (" + ", ".join(own[:5]) + "): prove takes a pytest run at the repository root "
@@ -1685,7 +1935,7 @@ def _prove_in(work, runner, repo, base, head, opts, suite, old_tests, new_tests,
             o, n = free.pop()
         try:
             return _compare(runner, c, o, n, old_tests, new_tests, old_clean, new_clean, baseline, budgets,
-                            (collected_old, collected_new))
+                            (collected_old, collected_new), subsets)
         finally:
             with free_lock:
                 free.append((o, n))
@@ -1706,7 +1956,7 @@ def _prove_in(work, runner, repo, base, head, opts, suite, old_tests, new_tests,
         pool.shutdown(wait=True, cancel_futures=True)
 
     _confirm(runner, rows, candidates, clean_old, clean_new, old_tests, new_tests, opts, budgets,
-             (collected_old, collected_new))
+             (collected_old, collected_new), subsets)
     counts: dict[str, int] = {}
     for row in rows:
         counts[row["category"]] = counts.get(row["category"], 0) + 1
@@ -1736,16 +1986,33 @@ def _prove_in(work, runner, repo, base, head, opts, suite, old_tests, new_tests,
     return report
 
 
+def _partial(collected: Collected | None, tests: list[str]) -> bool:
+    """Whether a run of these test files is less than the side's whole suite: exit 5 (no test ran) is then no catch,
+    since the whole suite runs others."""
+    return collected is None or bool(collected.dirs) or not collected.files <= set(tests)
+
+
+def _catch_key(label: str) -> str:
+    """What a catch label names: the test, without what happened to it, or the run as a whole."""
+    return "(run)" if label.startswith("(") else label.split(" (", 1)[0]
+
+
+def _same_catch(first: list[str] | None, again: list[str] | None) -> list[str]:
+    """The catches of the first round that the second round repeats."""
+    keys = {_catch_key(label) for label in again or []}
+    return [label for label in first or [] if _catch_key(label) in keys]
+
+
 def _compare(runner, c, o, n, old_tests, new_tests, old_clean, new_clean, baseline, budgets,
-             collected=(None, None)) -> dict:
+             collected=(None, None), subsets=(True, True)) -> dict:
     o.reset(c)
     old_k = _killed(old_clean, runner.pytest(o.path, old_tests, budgets["old"], old_side=True), collected[0],
-                    subset=True)
+                    subset=subsets[0])
     new_k = None
     if new_tests:
         n.reset(c)
         new_k = _killed(new_clean, runner.pytest(n.path, new_tests, budgets["new"], old_side=False), collected[1],
-                        ambiguous_counts=True, subset=True)
+                        ambiguous_counts=True, subset=subsets[1])
     row = {"id": c.mid, "op": c.op, "path": c.path, "line": c.line, "what": c.what, "before": c.before,
            "after": c.after, "rank": c.priority, "old_caught_by": old_k, "new_caught_by": new_k}
     row["category"] = {(True, True): "both", (True, False): "old only", (False, True): "new only",
@@ -1766,8 +2033,9 @@ def _compare(runner, c, o, n, old_tests, new_tests, old_clean, new_clean, baseli
 
 
 def _confirm(runner, rows, candidates, clean_old, clean_new, old_tests, new_tests, opts, budgets,
-             collected=(None, None)) -> None:
-    """Run every loss again, one run at a time, against clean runs made the same way; keep the losses that repeat."""
+             collected=(None, None), subsets=(True, True)) -> None:
+    """Run every loss again, one run at a time, against clean runs made the same way; keep the losses that repeat:
+    the same old test, or the old run as a whole, catches it again, and nothing new does."""
     losses = [(row, c) for row, c in zip(rows, candidates) if row["category"] == "loss"]
     if not losses:
         return
@@ -1786,15 +2054,21 @@ def _confirm(runner, rows, candidates, clean_old, clean_new, old_tests, new_test
         else:
             clean_old.reset(c)
             run = runner.pytest(clean_old.path, old_tests, budgets["old"], old_side=True)
-            if _killed(old_ref, run, collected[0], subset=True) is None:
+            again = _killed(old_ref, run, collected[0], subset=subsets[0])
+            same = _same_catch(row["old_caught_by"], again)
+            if again is None:
                 why = "the old tests did not catch it again"
+            elif not same:
+                why = "other old tests caught it the second time: " + ", ".join(again[:3])
+            else:
+                row["old_caught_by"] = same
         if why is None and new_ref is not None:
             if not new_ref.usable:
                 why = f"the clean new run made to confirm it gave no usable result (pytest exit {new_ref.code})"
             else:
                 clean_new.reset(c)
                 run = runner.pytest(clean_new.path, new_tests, budgets["new"], old_side=False)
-                if _killed(new_ref, run, collected[1], ambiguous_counts=True, subset=True):
+                if _killed(new_ref, run, collected[1], ambiguous_counts=True, subset=subsets[1]):
                     why = "the new tests caught it when run alone"
         if why is None:
             if not suite_ref.usable:
